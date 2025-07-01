@@ -1,0 +1,11 @@
+# Core LangChain/LangGraph libraries
+langchain
+langgraph
+langchain_google_genai
+langchain-tavily
+
+# Pydantic for robust configuration management
+pydantic
+
+# Utility for environment variables
+python-dotenv
