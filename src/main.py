@@ -3,6 +3,7 @@ from pathlib import Path
 import argparse
 from dotenv import load_dotenv
 import os
+import asyncio  # Import the asyncio library
 
 # 1. Load environment variables
 load_dotenv()
@@ -17,7 +18,7 @@ from typing import List
 
 from langchain_core.messages import HumanMessage, BaseMessage, AIMessage, ToolMessage
 
-from src.graph.builder import build_graph
+from src.graph.workflow import build_graph
 from src.graph.state import GroupChatState
 
 # --- Basic Configuration ---
@@ -75,36 +76,28 @@ def log_conversation_turn(
     file_handle.flush()  # Ensure data is written to disk immediately
 
 
-def main(team_config_path: Path):
+async def main(team_config_path: Path):  # Changed to async def
     """
-    The main function to run the multi-agent group chat application.
-
-    Args:
-        team_config_path: The path to the team's JSON configuration file.
+    The main asynchronous function to run the multi-agent group chat application.
     """
-
-    # 2. Set up conversation log file
+    # Set up conversation log file
     log_dir = Path("conversations")
     log_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file_path = log_dir / f"conversation_{timestamp}.md"
     logger.info(f"Conversation will be logged to: {log_file_path}")
 
-    # 3. Build the graph
+    # Build the graph
     logger.info("Building the graph...")
     graph = build_graph(team_config_path)
     logger.info("Graph built successfully.")
 
-    # 4. Start the interactive chat loop within a file-writing context
+    # Start the interactive chat loop
     with open(log_file_path, "w", encoding="utf-8") as log_file:
         log_file.write(f"# Conversation Log\n\n**Team:** `{team_config_path.stem}`\n")
         log_file.write(f"**Timestamp:** `{timestamp}`\n")
 
-        current_state: GroupChatState = {
-            "messages": [],
-            "active_tasks": {},
-            "completed_tasks": set(),
-        }
+        full_history: List[BaseMessage] = []
         turn_count = 0
 
         logger.info("Starting interactive chat session. Type 'quit' or 'exit' to end.")
@@ -114,30 +107,33 @@ def main(team_config_path: Path):
 
         while True:
             try:
-                user_input = input("User: ")
+                # Use asyncio.to_thread to run blocking input() in a separate thread
+                user_input = await asyncio.to_thread(input, "User: ")
                 if user_input.lower() in ["quit", "exit"]:
                     print("Exiting chat session.")
                     break
 
                 turn_count += 1
                 user_message = HumanMessage(content=user_input, name="user")
-                current_state["messages"] = [user_message]
+                full_history.append(user_message)
+
+                current_state: GroupChatState = {"messages": full_history}
 
                 print("\n...Assistant is thinking...\n")
-                final_state = graph.invoke(current_state)
 
-                # Log the entire turn's messages to the file
-                log_conversation_turn(log_file, turn_count, final_state["messages"])
+                # Use ainvoke for the asynchronous graph
+                final_turn_state = await graph.ainvoke(current_state)
 
-                current_state = final_state
+                new_messages = final_turn_state["messages"]
+                full_history.extend(new_messages)
 
-                final_response = final_state["messages"][-1]
-                if final_response.name == "orchestrator":
-                    print(f"[Orchestrator]: {final_response.content}")
-                else:
-                    print(
-                        f"[{final_response.name or 'System'}]: {final_response.content}"
-                    )
+                log_conversation_turn(
+                    log_file, turn_count, [user_message] + new_messages
+                )
+
+                for msg in new_messages:
+                    if isinstance(msg, AIMessage):
+                        print(f"[{msg.name or 'AI'}]: {msg.content}")
 
                 print("-" * 80)
 
@@ -169,4 +165,9 @@ if __name__ == "__main__":
             f"Configuration file not found at the specified path: {args.config}"
         )
 
-    main(team_config_path=args.config)
+    # Run the main async function
+    try:
+        asyncio.run(main(team_config_path=args.config))
+    except (KeyboardInterrupt, EOFError):
+        # This handles cases where the user exits before the loop starts
+        print("\nExiting application.")
