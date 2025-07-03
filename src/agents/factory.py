@@ -1,90 +1,112 @@
+"""LangGraph-based agent factory."""
+
 import logging
+from typing import Dict, List, Optional, Any
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_tavily import TavilySearch
-from langchain_core.prompts import MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import BaseTool
+from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt.chat_agent_executor import AgentState
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.configs.models import AgentConfig, TeamConfig
+from src.configs.settings import settings
+from src.core.exceptions import AgentError, ConfigurationError
+from src.core.logging import AgentLogger
 from src.prompts.templates import AGENT_SYSTEM_PROMPT_TEMPLATE
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - [%(name)s] - %(message)s"
-)
-logger = logging.getLogger(__name__)
 
-# A mapping from tool names to their implementation
-# This allows us to dynamically add tools to agents based on their config
-SUPPORTED_TOOLS = {
-    "tavily_search_results_json": TavilySearch(max_results=3)
-    # Add other tools here as they are created
-}
+class AgentFactory:
+    """Factory for creating LangGraph agents."""
 
+    def __init__(self):
+        self.supported_tools: Dict[str, BaseTool] = {}
+        self._register_default_tools()
 
-def create_agent_runnable(
-    agent_config: AgentConfig, team_config: TeamConfig
-) -> AgentExecutor:
-    """
-    Factory function to create a LangChain AgentExecutor (a runnable) for a given agent.
+    def _register_default_tools(self):
+        """Register default tools."""
+        from src.agents.tools import get_default_tools
 
-    Args:
-        agent_config: The configuration for the specific agent to be created.
-        team_config: The configuration for the team, used to provide context to the agent.
+        for tool in get_default_tools():
+            self.supported_tools[tool.name] = tool
 
-    Returns:
-        An AgentExecutor instance ready to be used as a node in the LangGraph.
-    """
-    logger.info(f"Creating agent runnable for: {agent_config.name}")
+    def register_tool(self, tool: BaseTool):
+        """Register a new tool."""
+        self.supported_tools[tool.name] = tool
 
-    # 1. Instantiate the LLM
-    llm = ChatGoogleGenerativeAI(
-        model=agent_config.model_name,
-        temperature=agent_config.temperature,
-        **agent_config.kwargs,
+    @retry(
+        stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10)
     )
+    def create_agent(self, agent_config: AgentConfig, team_config: TeamConfig) -> Any:
+        """Create a LangGraph react agent."""
+        logger = AgentLogger(agent_config.name)
+        logger.info("Creating LangGraph agent", config=agent_config.dict())
 
-    # 2. Format the system prompt with team and agent details
-    team_agent_names = [agent.name for agent in team_config.agents]
-    formatted_system_prompt = AGENT_SYSTEM_PROMPT_TEMPLATE.format(
-        agent_name=agent_config.name,
-        agent_specific_prompt=agent_config.system_prompt_template,
-        team_name=team_config.team_name,
-        team_desc=team_config.team_description,
-        team_agent_list=", ".join(team_agent_names),
-    )
+        try:
+            # Create LLM
+            llm = self._create_llm(agent_config)
 
-    # 3. Create the prompt template
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", formatted_system_prompt),
-            MessagesPlaceholder(variable_name="messages"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ]
-    )
+            # Get tools
+            tools = self._get_agent_tools(agent_config, logger)
 
-    # 4. Instantiate and gather the tools for this agent
-    agent_tools = []
-    for tool_name in agent_config.tools:
-        if tool_name in SUPPORTED_TOOLS:
-            agent_tools.append(SUPPORTED_TOOLS[tool_name])
-            logger.info(f"Added tool '{tool_name}' to agent '{agent_config.name}'")
-        else:
-            logger.warning(
-                f"Tool '{tool_name}' is not supported and will be skipped for agent '{agent_config.name}'."
+            # Create prompt
+            prompt = self._create_agent_prompt(agent_config, team_config)
+
+            # Create react agent
+            agent = create_react_agent(
+                model=llm,
+                tools=tools,
+                prompt=prompt,
+                checkpointer=None,  # Will be set at graph level
+                debug=settings.log_level == "DEBUG",
             )
 
-    # 5. Create the agent itself using the robust `create_tool_calling_agent`
-    agent = create_tool_calling_agent(llm, agent_tools, prompt)
+            logger.info("Successfully created LangGraph agent")
+            return agent
 
-    # 6. Create the AgentExecutor, which is the final runnable
-    # The handle_parsing_errors flag provides additional robustness
-    agent_executor = AgentExecutor(
-        agent=agent,
-        tools=agent_tools,
-        verbose=True,  # Set to True for detailed agent step logging
-        handle_parsing_errors=True,
-    )
+        except Exception as e:
+            logger.error("Failed to create agent", error=str(e))
+            raise AgentError(agent_config.name, f"Failed to create agent: {e}", e)
 
-    logger.info(f"Successfully created agent executor for '{agent_config.name}'")
-    return agent_executor
+    def _create_llm(self, agent_config: AgentConfig) -> ChatGoogleGenerativeAI:
+        """Create the LLM for the agent."""
+        return ChatGoogleGenerativeAI(
+            model=agent_config.model_name,
+            temperature=agent_config.temperature,
+            api_key=settings.google_api_key,
+            **agent_config.kwargs,
+        )
+
+    def _get_agent_tools(
+        self, agent_config: AgentConfig, logger: AgentLogger
+    ) -> List[BaseTool]:
+        """Get tools for the agent."""
+        tools = []
+        for tool_name in agent_config.tools:
+            if tool_name in self.supported_tools:
+                tools.append(self.supported_tools[tool_name])
+                logger.info("Added tool to agent", tool=tool_name)
+            else:
+                logger.warning("Tool not supported", tool=tool_name)
+                raise ConfigurationError(f"Tool '{tool_name}' not supported")
+        return tools
+
+    def _create_agent_prompt(
+        self, agent_config: AgentConfig, team_config: TeamConfig
+    ) -> ChatPromptTemplate:
+        """Create the agent prompt."""
+        team_agent_names = [agent.name for agent in team_config.agents]
+        formatted_system_prompt = AGENT_SYSTEM_PROMPT_TEMPLATE.format(
+            agent_name=agent_config.name,
+            agent_specific_prompt=agent_config.system_prompt_template,
+            team_name=team_config.team_name,
+            team_desc=team_config.team_description,
+            team_agent_list=", ".join(team_agent_names),
+        )
+
+        return ChatPromptTemplate.from_messages(
+            [
+                ("system", formatted_system_prompt),
+                MessagesPlaceholder(variable_name="messages"),
+            ]
+        )

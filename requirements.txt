@@ -1,11 +1,30 @@
-# Core LangChain/LangGraph libraries
-langchain
+# Core LangGraph and LangChain
 langgraph
-langchain_google_genai
+langchain-core
+langchain-google-genai
+
+# Tools and integrations
 langchain-tavily
 
-# Pydantic for robust configuration management
+# Configuration and validation
 pydantic
+pydantic-settings
 
-# Utility for environment variables
+# Logging and monitoring
+structlog
+
+# Retry and resilience
+tenacity
+
+# Async support
+asyncio-throttle
+
+# Development and testing
+pytest
+pytest-asyncio
+black
+isort
+mypy
+
+# Environment management
 python-dotenv

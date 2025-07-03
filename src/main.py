@@ -1,158 +1,144 @@
-import logging
+"""Enhanced main application with better error handling and monitoring."""
+
+import dotenv
+
+dotenv.load_dotenv(".env")
+
+import sys
 from pathlib import Path
 import argparse
-from dotenv import load_dotenv
-import os
-
-# 1. Load environment variables
-load_dotenv()
-if not os.getenv("GOOGLE_API_KEY") or not os.getenv("TAVILY_API_KEY"):
-    raise ValueError(
-        "API keys for Google (GOOGLE_API_KEY) and Tavily (TAVILY_API_KEY) "
-        "must be set in a .env file in the project root."
-    )
-
+from typing import Optional
 from datetime import datetime
-from typing import List
 
-from langchain_core.messages import HumanMessage, BaseMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.memory import MemorySaver
 
 from src.graph.builder import build_graph
 from src.graph.state import GroupChatState
+from src.core.logging import configure_logging, get_logger
+from src.core.exceptions import SynapseError
+from src.configs.settings import settings
 
-# --- Basic Configuration ---
-# Configure top-level logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - [%(name)s] - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+# Configure logging
+configure_logging(
+    log_level=settings.log_level,
+    log_file=settings.log_file,
+    json_logs=settings.json_logs,
 )
-logger = logging.getLogger(__name__)
+
+logger = get_logger(__name__)
 
 
-def format_message_for_log(msg: BaseMessage) -> str:
-    """Formats a single message object into a detailed, readable string for logging."""
-    log_entry = []
+class ConversationManager:
+    """Manages conversation state and logging."""
 
-    if isinstance(msg, HumanMessage):
-        sender = f"User ({msg.name or 'user'})"
-        log_entry.append(f"### Sender: {sender}")
-        log_entry.append(f"**Content:**\n{msg.content}")
+    def __init__(self, team_config_path: Path):
+        self.team_config_path = team_config_path
+        self.conversation_id = f"conv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.graph = None
+        self.checkpointer = MemorySaver()
+        self._initialize_graph()
 
-    elif isinstance(msg, AIMessage):
-        sender = f"Agent ({msg.name or 'AI'})"
-        log_entry.append(f"### Sender: {sender}")
-        if msg.content:
-            log_entry.append(f"**Content:**\n{msg.content}")
-        if msg.tool_calls:
-            log_entry.append("\n**Tool Calls:**")
-            for i, tool_call in enumerate(msg.tool_calls):
-                log_entry.append(f"  - **Call {i+1}:**")
-                log_entry.append(f"    - **Name:** `{tool_call['name']}`")
-                log_entry.append(f"    - **Arguments:** `{tool_call['args']}`")
-                log_entry.append(f"    - **ID:** `{tool_call['id']}`")
+    def _initialize_graph(self):
+        """Initialize the graph with error handling."""
+        try:
+            logger.info("Initializing graph", config=str(self.team_config_path))
+            self.graph = build_graph(self.team_config_path, self.checkpointer)
+            logger.info("Graph initialized successfully")
+        except Exception as e:
+            logger.error("Failed to initialize graph", error=str(e))
+            raise SynapseError(f"Failed to initialize graph: {e}")
 
-    elif isinstance(msg, ToolMessage):
-        sender = f"Tool ({msg.name or 'tool'})"
-        log_entry.append(f"### Sender: {sender}")
-        log_entry.append(f"**Content:**\n{msg.content}")
-        log_entry.append(f"**Tool Call ID:** `{msg.tool_call_id}`")
+    def process_message(self, user_input: str) -> str:
+        """Process a user message and return response."""
+        try:
+            # Create initial state
+            initial_state: GroupChatState = {
+                "messages": [HumanMessage(content=user_input, name="user")],
+                "active_tasks": {},
+                "completed_tasks": set(),
+                "failed_tasks": set(),
+                "round_number": 0,
+                "error_count": 0,
+                "context": {},
+                "conversation_id": self.conversation_id,
+            }
 
-    else:
-        log_entry.append(f"### Unknown Message Type: {type(msg).__name__}")
-        log_entry.append(str(msg))
+            # Configure for conversation
+            config = {
+                "configurable": {"thread_id": self.conversation_id},
+                "recursion_limit": settings.max_iterations,
+            }
 
-    return "\n".join(log_entry)
+            logger.info(
+                "Processing message",
+                input_length=len(user_input),
+                conversation_id=self.conversation_id,
+            )
+
+            # Invoke graph
+            final_state = self.graph.invoke(initial_state, config)
+
+            # Extract response
+            final_message = final_state["messages"][-1]
+            response = final_message.content
+
+            logger.info(
+                "Message processed successfully",
+                response_length=len(response),
+                round_count=final_state.get("round_number", 0),
+                error_count=final_state.get("error_count", 0),
+            )
+
+            return response
+
+        except Exception as e:
+            logger.error("Failed to process message", error=str(e))
+            return f"I encountered an error: {str(e)}. Please try again."
 
 
-def log_conversation_turn(
-    file_handle, turn_number: int, messages_in_turn: List[BaseMessage]
-):
-    """Writes a detailed log of a single conversation turn to the given file."""
-    file_handle.write(f"\n\n---\n\n## Turn {turn_number}\n\n")
-    for msg in messages_in_turn:
-        file_handle.write(format_message_for_log(msg) + "\n\n")
-    file_handle.flush()  # Ensure data is written to disk immediately
+def run_interactive_chat(team_config_path: Path):
+    """Run interactive chat session."""
+    try:
+        conversation_manager = ConversationManager(team_config_path)
 
-
-def main(team_config_path: Path):
-    """
-    The main function to run the multi-agent group chat application.
-
-    Args:
-        team_config_path: The path to the team's JSON configuration file.
-    """
-
-    # 2. Set up conversation log file
-    log_dir = Path("conversations")
-    log_dir.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file_path = log_dir / f"conversation_{timestamp}.md"
-    logger.info(f"Conversation will be logged to: {log_file_path}")
-
-    # 3. Build the graph
-    logger.info("Building the graph...")
-    graph = build_graph(team_config_path)
-    logger.info("Graph built successfully.")
-
-    # 4. Start the interactive chat loop within a file-writing context
-    with open(log_file_path, "w", encoding="utf-8") as log_file:
-        log_file.write(f"# Conversation Log\n\n**Team:** `{team_config_path.stem}`\n")
-        log_file.write(f"**Timestamp:** `{timestamp}`\n")
-
-        current_state: GroupChatState = {
-            "messages": [],
-            "active_tasks": {},
-            "completed_tasks": set(),
-        }
-        turn_count = 0
-
-        logger.info("Starting interactive chat session. Type 'quit' or 'exit' to end.")
         print("-" * 80)
-        print("Multi-Agent Group Chat is running. Start by typing your message.")
+        print("🤖 Multi-Agent Group Chat (LangGraph v0.3)")
+        print("Type 'quit' or 'exit' to end the session")
         print("-" * 80)
 
         while True:
             try:
-                user_input = input("User: ")
+                user_input = input("\n👤 You: ").strip()
+
                 if user_input.lower() in ["quit", "exit"]:
-                    print("Exiting chat session.")
+                    print("👋 Goodbye!")
                     break
 
-                turn_count += 1
-                user_message = HumanMessage(content=user_input, name="user")
-                current_state["messages"] = [user_message]
+                if not user_input:
+                    continue
 
-                print("\n...Assistant is thinking...\n")
-                final_state = graph.invoke(current_state)
-
-                # Log the entire turn's messages to the file
-                log_conversation_turn(log_file, turn_count, final_state["messages"])
-
-                current_state = final_state
-
-                final_response = final_state["messages"][-1]
-                if final_response.name == "orchestrator":
-                    print(f"[Orchestrator]: {final_response.content}")
-                else:
-                    print(
-                        f"[{final_response.name or 'System'}]: {final_response.content}"
-                    )
-
-                print("-" * 80)
+                print("\n🤔 Thinking...")
+                response = conversation_manager.process_message(user_input)
+                print(f"\n🤖 Assistant: {response}")
 
             except (KeyboardInterrupt, EOFError):
-                print("\nExiting chat session.")
+                print("\n👋 Goodbye!")
                 break
-            except Exception:
-                logger.exception("An unexpected error occurred during the chat loop.")
-                log_file.write("\n\n**An unexpected error occurred. Ending session.**")
-                break
+            except Exception as e:
+                logger.error("Unexpected error in chat loop", error=str(e))
+                print(f"❌ An unexpected error occurred: {e}")
+
+    except Exception as e:
+        logger.error("Failed to start chat session", error=str(e))
+        print(f"❌ Failed to start chat: {e}")
+        sys.exit(1)
 
 
-if __name__ == "__main__":
+def main():
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Run a multi-agent group chat application using LangGraph.",
+        description="Multi-Agent Group Chat using LangGraph v0.3",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -160,13 +146,42 @@ if __name__ == "__main__":
         "--config",
         type=Path,
         required=True,
-        help="Path to the team configuration JSON file.",
+        help="Path to team configuration JSON file",
     )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Set logging level",
+    )
+
     args = parser.parse_args()
 
+    # Validate config file
     if not args.config.is_file():
-        raise FileNotFoundError(
-            f"Configuration file not found at the specified path: {args.config}"
-        )
+        print(f"❌ Configuration file not found: {args.config}")
+        sys.exit(1)
 
-    main(team_config_path=args.config)
+    # Override log level if provided
+    if args.log_level:
+        import os
+
+        os.environ["LOG_LEVEL"] = args.log_level
+
+    logger.info(
+        "Starting application",
+        config_file=str(args.config),
+        log_level=settings.log_level,
+    )
+
+    try:
+        run_interactive_chat(args.config)
+    except KeyboardInterrupt:
+        logger.info("Application interrupted by user")
+    except Exception as e:
+        logger.error("Application failed", error=str(e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

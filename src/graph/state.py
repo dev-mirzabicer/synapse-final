@@ -1,28 +1,47 @@
+"""Enhanced state management for the multi-agent system."""
+
 import operator
-from typing import List, Dict, Set, Annotated
+from typing import List, Dict, Set, Annotated, Optional, Any
 from typing_extensions import TypedDict
 from langchain_core.messages import BaseMessage
+from pydantic import BaseModel, Field
+from datetime import datetime
+
+
+class TaskInfo(BaseModel):
+    """Information about a task assigned to an agent."""
+
+    agent_name: str
+    task_description: str
+    assigned_at: datetime
+    status: str = "pending"  # pending, in_progress, completed, failed
+    error_message: Optional[str] = None
+    retry_count: int = 0
 
 
 class GroupChatState(TypedDict):
-    """
-    Represents the complete state of the group chat application.
-
-    This state is passed between all nodes in the graph.
-    """
+    """Enhanced state for the group chat application."""
 
     messages: Annotated[List[BaseMessage], operator.add]
-    """The list of all messages in the conversation, serving as the shared history."""
+    """Complete conversation history."""
 
-    active_tasks: Dict[str, str]
-    """
-    A dictionary mapping an agent's name to its currently assigned task.
-    The presence of an agent's name as a key indicates it is currently working.
-    e.g., {'researcher': 'Find the latest news on AI.'}
-    """
+    active_tasks: Dict[str, TaskInfo]
+    """Currently active tasks by agent name."""
 
     completed_tasks: Set[str]
-    """
-    A set of agent names that have finished their tasks in the current round.
-    This is used by the aggregator to determine when a round of parallel work is complete.
-    """
+    """Agent names that completed their tasks this round."""
+
+    failed_tasks: Set[str]
+    """Agent names whose tasks failed this round."""
+
+    round_number: int
+    """Current orchestration round."""
+
+    error_count: int
+    """Total number of errors encountered."""
+
+    context: Dict[str, Any]
+    """Additional context for agents."""
+
+    conversation_id: Optional[str]
+    """Unique identifier for this conversation."""
