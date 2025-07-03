@@ -24,7 +24,7 @@ def _personalize_history(state: GroupChatState, agent_name: str) -> List[BaseMes
         if isinstance(msg, AIMessage) and msg.name == agent_name:
             personalized_messages.append(msg)
         elif isinstance(msg, AIMessage):
-            content = f"[AGENT {msg.name}]\n\n{msg.content}"
+            content = f"[NOT_A_USER | AGENT {msg.name}]\n\n{msg.content}"
             personalized_messages.append(HumanMessage(content=content, name=msg.name))
         elif isinstance(msg, HumanMessage):
             content = f"[USER]\n\n{msg.content}"
@@ -125,7 +125,7 @@ def create_agent_node(agent_runnable: Any, agent_name: str) -> Callable:
 
             # Add task message
             task_message = HumanMessage(
-                content=f"[TASK]\n\n{task_info.task_description}",
+                content=f"[NOT_A_USER | TASK ASSIGNED TO YOU BY THE ORCHESTRATOR]\n\n{task_info.task_description}",
             )
             final_history = personalized_history + [task_message]
 
