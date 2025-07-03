@@ -55,10 +55,11 @@ def orchestrator_node(state: GroupChatState, orchestrator_runnable) -> GroupChat
     personalized_history = _personalize_history(state, "orchestrator")
 
     # The orchestrator runnable is an LLM with the `assign_tasks` tool bound
-    response = orchestrator_runnable.invoke({"messages": personalized_history})
+    orchestrator_message = orchestrator_runnable.invoke(
+        {"messages": personalized_history}
+    )
 
-    # The response is the orchestrator's message, which may contain tool calls
-    orchestrator_message = response
+    orchestrator_message.name = "orchestrator"  # Ensure the orchestrator's name is set
 
     active_tasks = {}
     tool_message = None
@@ -79,7 +80,7 @@ def orchestrator_node(state: GroupChatState, orchestrator_runnable) -> GroupChat
                 f"Orchestrator called an unexpected tool: {tool_call['name']}. Expected 'assign_tasks'."
             )
         tool_message = ToolMessage(
-            content=f"Tasks assigned: {', '.join(active_tasks.keys())}",
+            content=f"Tasks assigned by the Orchestrator: {', '.join(active_tasks.keys())}",
             tool_call_id=tool_call["id"],
         )
 
@@ -126,6 +127,8 @@ def create_agent_node(agent_runnable: AgentExecutor, agent_name: str) -> Callabl
 
         # Invoke the agent executor with the personalized history and task
         result = agent_runnable.invoke({"messages": final_history})
+
+        print("EXTRADEBUG:", result)
 
         response_message = AIMessage(content=str(result["output"]), name=agent_name)
 
