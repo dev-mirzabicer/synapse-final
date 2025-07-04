@@ -1,12 +1,10 @@
 """LangGraph-based agent factory."""
 
-import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Any
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool
 from langgraph.prebuilt import create_react_agent
-from langgraph.prebuilt.chat_agent_executor import AgentState
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.configs.models import AgentConfig, TeamConfig

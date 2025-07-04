@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Any, Optional
 from enum import Enum
 
@@ -69,7 +69,7 @@ class AgentConfig(BaseModel):
         60, description="Timeout for agent execution in seconds", gt=0
     )
 
-    @validator("name")
+    @field_validator("name")
     def validate_name(cls, v):
         """Validate agent name."""
         if not v.replace("_", "").replace("-", "").isalnum():
@@ -78,7 +78,7 @@ class AgentConfig(BaseModel):
             )
         return v
 
-    @validator("tools")
+    @field_validator("tools")
     def validate_tools(cls, v):
         """Validate tool names."""
         if len(v) != len(set(v)):
@@ -126,7 +126,7 @@ class TeamConfig(BaseModel):
         description="Conversation flow configuration",
     )
 
-    @validator("agents")
+    @field_validator("agents")
     def validate_unique_agent_names(cls, v):
         """Ensure all agent names are unique."""
         names = [agent.name for agent in v]
@@ -134,7 +134,7 @@ class TeamConfig(BaseModel):
             raise ValueError("All agent names must be unique")
         return v
 
-    @validator("agents")
+    @field_validator("agents")
     def validate_orchestrator_not_in_agents(cls, v):
         """Ensure no agent is named 'orchestrator'."""
         for agent in v:

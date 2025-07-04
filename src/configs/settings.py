@@ -1,10 +1,9 @@
 """Application settings and configuration."""
 
-from typing import Dict, Any, Optional
+from typing import Optional
 from pathlib import Path
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
-import os
 
 
 class AppSettings(BaseSettings):

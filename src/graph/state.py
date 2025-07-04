@@ -4,7 +4,7 @@ import operator
 from typing import List, Dict, Set, Annotated, Optional, Any
 from typing_extensions import TypedDict
 from langchain_core.messages import BaseMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from datetime import datetime
 
 
