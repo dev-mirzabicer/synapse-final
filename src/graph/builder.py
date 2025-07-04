@@ -1,117 +1,195 @@
-import logging
+"""Enhanced graph builder with better error handling and monitoring."""
+
 import json
-from functools import partial
 from pathlib import Path
+from functools import partial
+from typing import Optional, Any
 
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from src.configs.models import TeamConfig
-from src.agents.factory import create_agent_runnable
+from src.agents.factory import AgentFactory
 from src.agents.tools import assign_tasks
 from src.prompts.templates import ORCHESTRATOR_SYSTEM_PROMPT_TEMPLATE
+from src.core.logging import get_logger
+from src.core.exceptions import ConfigurationError
+from src.configs.settings import settings
 from .state import GroupChatState
 from .nodes import orchestrator_node, create_agent_node, aggregator_node
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - [%(name)s] - %(message)s"
-)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
-def build_graph(team_config_path: Path):
-    """
-    Builds and compiles the LangGraph for the multi-agent group chat.
-    """
-    # 1. Load configurations
-    logger.info(f"Loading team configuration from: {team_config_path}")
-    config_data = json.loads(team_config_path.read_text())
-    team_config = TeamConfig(**config_data)
+class GraphBuilder:
+    """Enhanced graph builder with better error handling."""
 
-    # 2. Create the Orchestrator's LLM with its specific tool
-    team_agent_names = [agent.name for agent in team_config.agents]
-    formatted_orchestrator_prompt = ORCHESTRATOR_SYSTEM_PROMPT_TEMPLATE.format(
-        team_name=team_config.team_name,
-        team_desc=team_config.team_description,
-        team_agent_list=", ".join(team_agent_names),
-    )
+    def __init__(self):
+        self.agent_factory = AgentFactory()
 
-    # Use a ChatPromptTemplate for robust and clear prompt construction
-    orchestrator_prompt_template = ChatPromptTemplate.from_messages(
-        [
-            ("system", formatted_orchestrator_prompt),
-            MessagesPlaceholder(variable_name="messages"),
-        ]
-    )
+    def build_graph(self, team_config_path: Path, checkpointer: Optional[Any] = None):
+        """Build and compile the enhanced LangGraph."""
+        logger.info("Building graph", config_path=str(team_config_path))
 
-    # Create the orchestrator LLM with the assign_tasks tool bound
-    orchestrator_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-    orchestrator_llm_with_tools = orchestrator_llm.bind_tools([assign_tasks])
+        try:
+            # Load and validate configuration
+            team_config = self._load_team_config(team_config_path)
 
-    # Chain the LLM with the tool to create a runnable
-    orchestrator_runnable = orchestrator_prompt_template | orchestrator_llm_with_tools
+            # Create orchestrator
+            orchestrator_runnable = self._create_orchestrator(team_config)
 
-    # 3. Create agent runnables
-    agent_runnables = {
-        agent_config.name: create_agent_runnable(agent_config, team_config)
-        for agent_config in team_config.agents
-    }
+            # Create agent runnables
+            agent_runnables = self._create_agent_runnables(team_config)
 
-    # 4. Define the graph
-    workflow = StateGraph(GroupChatState)
+            # Build the graph
+            workflow = self._build_workflow(orchestrator_runnable, agent_runnables)
 
-    # 5. Add nodes to the graph
-    # Orchestrator
-    workflow.add_node(
-        "orchestrator",
-        partial(orchestrator_node, orchestrator_runnable=orchestrator_runnable),
-    )
-    # Aggregator
-    workflow.add_node("aggregator", aggregator_node)
-    # Agent nodes
-    for agent_name, agent_runnable in agent_runnables.items():
-        workflow.add_node(agent_name, create_agent_node(agent_runnable, agent_name))
+            # Compile with checkpointer
+            if checkpointer is None:
+                checkpointer = MemorySaver()
 
-    # 6. Define the edges and control flow
-    workflow.set_entry_point("orchestrator")
-
-    # Conditional edge from the orchestrator
-    def orchestrator_router(state: GroupChatState):
-        if not state.get("active_tasks"):
-            logger.info("Orchestrator decided to end the turn.")
-            return END
-        else:
-            logger.info(
-                f"Orchestrator routing to agents: {list(state['active_tasks'].keys())}"
+            graph = workflow.compile(
+                checkpointer=checkpointer, debug=settings.log_level == "DEBUG"
             )
-            return list(state["active_tasks"].keys())
 
-    workflow.add_conditional_edges("orchestrator", orchestrator_router)
+            logger.info("Graph compiled successfully")
+            return graph
 
-    # Edges from all agents to the aggregator
-    for agent_name in agent_runnables.keys():
-        workflow.add_edge(agent_name, "aggregator")
+        except Exception as e:
+            logger.error("Failed to build graph", error=str(e))
+            raise ConfigurationError(f"Failed to build graph: {e}")
 
-    # Conditional edge from the aggregator
-    def aggregator_router(state: GroupChatState):
-        active_tasks = state.get("active_tasks", {})
-        completed_tasks = state.get("completed_tasks", set())
-        if completed_tasks == set(active_tasks.keys()):
-            logger.info("All tasks complete. Routing back to orchestrator.")
-            return "orchestrator"
-        else:
-            logger.info("Tasks still in progress. Waiting.")
-            return END
+    def _load_team_config(self, config_path: Path) -> TeamConfig:
+        """Load and validate team configuration."""
+        try:
+            config_data = json.loads(config_path.read_text())
+            return TeamConfig(**config_data)
+        except Exception as e:
+            raise ConfigurationError(f"Invalid configuration file: {e}")
 
-    workflow.add_conditional_edges(
-        "aggregator", aggregator_router, {"orchestrator": "orchestrator", END: END}
-    )
+    def _create_orchestrator(self, team_config: TeamConfig):
+        """Create the orchestrator runnable."""
+        team_agent_names = [agent.name for agent in team_config.agents]
+        formatted_prompt = ORCHESTRATOR_SYSTEM_PROMPT_TEMPLATE.format(
+            team_name=team_config.team_name,
+            team_desc=team_config.team_description,
+            team_agent_list=", ".join(team_agent_names),
+        )
 
-    # 7. Compile the graph
-    logger.info("Compiling the graph.")
-    graph = workflow.compile()
-    logger.info("Graph compiled successfully.")
+        prompt_template = ChatPromptTemplate.from_messages(
+            [
+                ("system", formatted_prompt),
+                MessagesPlaceholder(variable_name="messages"),
+            ]
+        )
 
-    return graph
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash", temperature=0, api_key=settings.google_api_key
+        )
+        llm_with_tools = llm.bind_tools([assign_tasks])
+
+        return prompt_template | llm_with_tools
+
+    def _create_agent_runnables(self, team_config: TeamConfig):
+        """Create all agent runnables."""
+        agent_runnables = {}
+
+        for agent_config in team_config.agents:
+            try:
+                agent = self.agent_factory.create_agent(agent_config, team_config)
+                agent_runnables[agent_config.name] = agent
+                logger.info("Created agent", name=agent_config.name)
+            except Exception as e:
+                logger.error(
+                    "Failed to create agent", name=agent_config.name, error=str(e)
+                )
+                raise
+
+        return agent_runnables
+
+    def _build_workflow(self, orchestrator_runnable, agent_runnables):
+        """Build the graph workflow."""
+        workflow = StateGraph(GroupChatState)
+
+        # Add nodes
+        workflow.add_node(
+            "orchestrator",
+            partial(orchestrator_node, orchestrator_runnable=orchestrator_runnable),
+        )
+        workflow.add_node("aggregator", aggregator_node)
+
+        for agent_name, agent_runnable in agent_runnables.items():
+            workflow.add_node(agent_name, create_agent_node(agent_runnable, agent_name))
+
+        # Add edges
+        workflow.set_entry_point("orchestrator")
+
+        # Orchestrator routing
+        def orchestrator_router(state: GroupChatState):
+            active_tasks = state.get("active_tasks", {})
+            if not active_tasks:
+                logger.info("No active tasks, ending")
+                return END
+
+            task_agents = list(active_tasks.keys())
+            logger.info("Routing to agents", agents=task_agents)
+            return task_agents
+
+        workflow.add_conditional_edges("orchestrator", orchestrator_router)
+
+        # Agent to aggregator edges
+        for agent_name in agent_runnables.keys():
+            workflow.add_edge(agent_name, "aggregator")
+
+        # Aggregator routing
+        def aggregator_router(state: GroupChatState):
+            """Fixed aggregator routing that waits for all agents."""
+            active_tasks = state.get("active_tasks", {})
+
+            if not active_tasks:
+                return END
+
+            # Count agent responses since last orchestrator message
+            agent_responses = set()
+
+            # Look at messages in reverse to find agent responses
+            for msg in reversed(state["messages"]):
+                if hasattr(msg, "name"):
+                    if msg.name == "orchestrator":
+                        break  # Stop at last orchestrator message
+                    elif msg.name in active_tasks:
+                        agent_responses.add(msg.name)
+
+            total_tasks = len(active_tasks)
+            responses_received = len(agent_responses)
+
+            logger.info(
+                "Aggregator routing",
+                total_tasks=total_tasks,
+                responses_received=responses_received,
+                responding_agents=list(agent_responses),
+            )
+
+            if responses_received >= total_tasks:
+                logger.info("All agents responded, routing to orchestrator")
+                return "orchestrator"
+            else:
+                logger.info(
+                    f"Waiting for {total_tasks - responses_received} more responses"
+                )
+                return END
+
+        workflow.add_conditional_edges(
+            "aggregator", aggregator_router, {"orchestrator": "orchestrator", END: END}
+        )
+
+        return workflow
+
+
+# Convenience function
+def build_graph(team_config_path: Path, checkpointer: Optional[Any] = None):
+    """Build graph using the enhanced builder."""
+    builder = GraphBuilder()
+    return builder.build_graph(team_config_path, checkpointer)
