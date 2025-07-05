@@ -14,7 +14,7 @@ class AppSettings(BaseSettings):
     tavily_api_key: str = Field(..., env="TAVILY_API_KEY")
 
     # Logging
-    log_level: str = Field("INFO", env="LOG_LEVEL")
+    log_level: str = Field("DEBUG", env="LOG_LEVEL")
     log_file: Optional[Path] = Field(None, env="LOG_FILE")
     json_logs: bool = Field(False, env="JSON_LOGS")
 

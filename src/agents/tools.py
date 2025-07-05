@@ -45,6 +45,32 @@ def assign_tasks(
 
 
 @tool
+def finish_my_turn(
+    summary: Annotated[
+        str, "A brief summary of what was accomplished during this turn"
+    ] = "",
+) -> str:
+    """
+    Signals that the agent has completed their current turn and is ready to return control.
+
+    This tool should be used when an agent has finished their work and wants to send
+    their public messages to the group chat. Any messages sent after using this tool
+    will not be seen by other agents until the next turn.
+
+    Args:
+        summary: Optional summary of work completed during this turn
+
+    Returns:
+        Confirmation that the turn has been finished
+    """
+    logger.info(
+        "Agent finishing turn", summary=summary, timestamp=datetime.now().isoformat()
+    )
+
+    return f"Turn completed successfully. {summary if summary else 'Work finished.'}"
+
+
+@tool
 def search_web(
     query: Annotated[str, "Search query for web search"],
     max_results: Annotated[int, "Maximum number of results to return"] = 3,
@@ -87,4 +113,13 @@ def get_default_tools() -> List[Any]:
         assign_tasks,
         search_web,
         # Add more tools here as needed
+    ]
+
+
+def get_agent_tools() -> List[Any]:
+    """Get the list of tools available specifically to agents (not orchestrator)."""
+    return [
+        finish_my_turn,
+        search_web,
+        # Add more agent-specific tools here as needed
     ]
