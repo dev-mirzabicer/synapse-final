@@ -1,4 +1,4 @@
-"""Enhanced state management for the multi-agent system with cursor-based personalization."""
+"""Enhanced state management for the multi-agent system with cursor-based personalization and robust task completion tracking."""
 
 import operator
 from typing import List, Dict, Set, Annotated, Optional, Any
@@ -14,14 +14,119 @@ logger = get_logger(__name__)
 
 
 class TaskInfo(BaseModel):
-    """Information about a task assigned to an agent."""
+    """Enhanced information about a task assigned to an agent with explicit completion tracking."""
 
     agent_name: str
     task_description: str
     assigned_at: datetime
     status: str = "pending"  # pending, in_progress, completed, failed
+    completed_at: Optional[datetime] = None
     error_message: Optional[str] = None
     retry_count: int = 0
+
+    def mark_in_progress(self) -> None:
+        """Mark task as in progress with validation and logging."""
+        if self.status not in ["pending"]:
+            logger.warning(
+                "Task status transition may be invalid",
+                agent=self.agent_name,
+                from_status=self.status,
+                to_status="in_progress",
+            )
+
+        self.status = "in_progress"
+        logger.info(
+            "Task marked as in progress",
+            agent=self.agent_name,
+            task_description=self.task_description[:100],
+        )
+
+    def mark_completed(self) -> None:
+        """Explicitly mark task as completed with validation and logging."""
+        if self.status in ["completed", "failed"]:
+            logger.warning(
+                "Attempting to mark already finished task as completed",
+                agent=self.agent_name,
+                current_status=self.status,
+                task_description=self.task_description[:100],
+            )
+            return
+
+        previous_status = self.status
+        self.status = "completed"
+        self.completed_at = datetime.now()
+
+        logger.info(
+            "Task explicitly marked as completed",
+            agent=self.agent_name,
+            previous_status=previous_status,
+            task_description=self.task_description[:100],
+            completion_time=self.completed_at.isoformat(),
+        )
+
+    def mark_failed(self, error_message: str) -> None:
+        """Explicitly mark task as failed with error tracking."""
+        if self.status in ["completed", "failed"]:
+            logger.warning(
+                "Attempting to mark already finished task as failed",
+                agent=self.agent_name,
+                current_status=self.status,
+                new_error=error_message[:100],
+            )
+            return
+
+        previous_status = self.status
+        self.status = "failed"
+        self.error_message = error_message
+        self.completed_at = datetime.now()
+        self.retry_count += 1
+
+        logger.error(
+            "Task explicitly marked as failed",
+            agent=self.agent_name,
+            previous_status=previous_status,
+            error_message=error_message[:200],
+            retry_count=self.retry_count,
+            completion_time=self.completed_at.isoformat(),
+        )
+
+    def is_finished(self) -> bool:
+        """Check if task is finished (completed or failed)."""
+        return self.status in ["completed", "failed"]
+
+    def is_pending(self) -> bool:
+        """Check if task is still pending."""
+        return self.status == "pending"
+
+    def is_in_progress(self) -> bool:
+        """Check if task is currently in progress."""
+        return self.status == "in_progress"
+
+    def is_successful(self) -> bool:
+        """Check if task completed successfully."""
+        return self.status == "completed"
+
+    def get_duration(self) -> Optional[float]:
+        """Get task duration in seconds if completed."""
+        if self.completed_at:
+            return (self.completed_at - self.assigned_at).total_seconds()
+        return None
+
+    def get_status_summary(self) -> Dict[str, Any]:
+        """Get comprehensive status summary for debugging."""
+        return {
+            "agent_name": self.agent_name,
+            "status": self.status,
+            "assigned_at": self.assigned_at.isoformat(),
+            "completed_at": self.completed_at.isoformat()
+            if self.completed_at
+            else None,
+            "duration_seconds": self.get_duration(),
+            "retry_count": self.retry_count,
+            "has_error": bool(self.error_message),
+            "error_preview": self.error_message[:100] if self.error_message else None,
+            "task_preview": self.task_description[:100],
+        }
 
 
 class AgentInternalState(BaseModel):
@@ -58,6 +163,24 @@ class AgentInternalState(BaseModel):
         """Mark the start of a new turn."""
         self.turn_finished = False  # Now working on a task
         self.continuation_attempts = 0
+
+    def get_state_summary(self) -> Dict[str, Any]:
+        """Get comprehensive state summary for debugging."""
+        return {
+            "agent_name": self.agent_name,
+            "cursor_position": self.cursor,
+            "personal_history_length": len(self.personal_history),
+            "has_temp_history": self.has_temp_history(),
+            "temp_history_length": len(self.temp_new_history)
+            if self.temp_new_history
+            else 0,
+            "turn_finished": self.turn_finished,
+            "continuation_attempts": self.continuation_attempts,
+            "has_current_task": self.current_task is not None,
+            "current_task_status": self.current_task.status
+            if self.current_task
+            else None,
+        }
 
 
 def add_messages_without_duplicates(
@@ -103,13 +226,47 @@ def merge_active_tasks(
 ) -> Dict[str, TaskInfo]:
     """
     Merge active tasks dictionaries, with new values overwriting existing ones.
+    Includes validation and logging for task state transitions.
     """
     if not new:
         return existing
 
     # Create a copy to avoid modifying the existing dict
     merged = existing.copy()
-    merged.update(new)
+
+    # Track changes for logging
+    updates = []
+    additions = []
+
+    for agent_name, new_task in new.items():
+        if agent_name in merged:
+            old_task = merged[agent_name]
+            if old_task.status != new_task.status:
+                updates.append(
+                    {
+                        "agent": agent_name,
+                        "old_status": old_task.status,
+                        "new_status": new_task.status,
+                        "task_preview": new_task.task_description[:50],
+                    }
+                )
+        else:
+            additions.append(
+                {
+                    "agent": agent_name,
+                    "status": new_task.status,
+                    "task_preview": new_task.task_description[:50],
+                }
+            )
+
+        merged[agent_name] = new_task
+
+    # Log significant changes
+    if updates:
+        logger.info("Task status updates in merge", updates=updates)
+    if additions:
+        logger.info("New tasks added in merge", additions=additions)
+
     return merged
 
 
@@ -159,7 +316,7 @@ class GroupChatState(TypedDict):
     """Internal states for each agent (including orchestrator) with personalized histories."""
 
     active_tasks: Annotated[Dict[str, TaskInfo], merge_active_tasks]
-    """Currently active tasks by agent name."""
+    """Currently active tasks by agent name with enhanced tracking."""
 
     completed_tasks: Annotated[Set[str], operator.or_]
     """Agent names that completed their tasks (union operation for sets)."""
@@ -307,6 +464,100 @@ def create_initial_state(
     return initial_state
 
 
+def validate_task_consistency(state: GroupChatState) -> List[str]:
+    """
+    Validate task state consistency and return any errors found.
+
+    This is critical for ensuring the robustness of concurrent execution.
+
+    Args:
+        state: The global state to validate
+
+    Returns:
+        List of validation error strings (empty if valid)
+    """
+    errors = []
+
+    active_tasks = state.get("active_tasks", {})
+    completed_tasks = state.get("completed_tasks", set())
+    failed_tasks = state.get("failed_tasks", set())
+
+    # Validate completed_tasks consistency
+    for agent_name in completed_tasks:
+        if agent_name not in active_tasks:
+            errors.append(
+                f"Agent {agent_name} in completed_tasks but not in active_tasks"
+            )
+        elif not active_tasks[agent_name].is_finished():
+            errors.append(
+                f"Agent {agent_name} in completed_tasks but TaskInfo status is {active_tasks[agent_name].status}"
+            )
+        elif not active_tasks[agent_name].is_successful():
+            errors.append(
+                f"Agent {agent_name} in completed_tasks but TaskInfo status is {active_tasks[agent_name].status} (not completed)"
+            )
+
+    # Validate failed_tasks consistency
+    for agent_name in failed_tasks:
+        if agent_name not in active_tasks:
+            errors.append(f"Agent {agent_name} in failed_tasks but not in active_tasks")
+        elif active_tasks[agent_name].status != "failed":
+            errors.append(
+                f"Agent {agent_name} in failed_tasks but TaskInfo status is {active_tasks[agent_name].status}"
+            )
+
+    # Check for impossible overlaps
+    overlap = completed_tasks & failed_tasks
+    if overlap:
+        errors.append(f"Agents in both completed AND failed: {overlap}")
+
+    # Validate TaskInfo status consistency
+    for agent_name, task_info in active_tasks.items():
+        if task_info.is_successful() and agent_name not in completed_tasks:
+            errors.append(
+                f"TaskInfo shows {agent_name} completed but not in completed_tasks set"
+            )
+        if task_info.status == "failed" and agent_name not in failed_tasks:
+            errors.append(
+                f"TaskInfo shows {agent_name} failed but not in failed_tasks set"
+            )
+
+    # Validate agent states exist for active tasks
+    agent_states = state.get("agent_states", {})
+    for agent_name in active_tasks:
+        if agent_name not in agent_states:
+            errors.append(
+                f"Active task for agent {agent_name} but no agent state found"
+            )
+
+    return errors
+
+
+def apply_state_validation(state: GroupChatState, context: str = "") -> bool:
+    """
+    Apply state validation and log any issues found.
+
+    Args:
+        state: The global state to validate
+        context: Context string for logging (e.g., "after aggregator")
+
+    Returns:
+        True if validation passed, False if errors found
+    """
+    errors = validate_task_consistency(state)
+
+    if errors:
+        logger.error(
+            f"State consistency errors detected {context}",
+            errors=errors,
+            error_count=len(errors),
+        )
+        return False
+    else:
+        logger.debug(f"State consistency validation passed {context}")
+        return True
+
+
 def validate_state_consistency(state: GroupChatState) -> bool:
     """
     Validate that the state is consistent (for debugging).
@@ -360,30 +611,11 @@ def validate_state_consistency(state: GroupChatState) -> bool:
                 )
                 return False
 
-        # Check task consistency
-        for agent_name in state["active_tasks"]:
-            if agent_name not in state["agent_states"]:
-                logger.error(f"Active task for non-existent agent: {agent_name}")
-                return False
-
-        # Completed and failed tasks should not overlap
-        overlap = state["completed_tasks"] & state["failed_tasks"]
-        if overlap:
-            logger.error(f"Tasks in both completed and failed: {overlap}")
+        # Check task consistency using new validation
+        task_errors = validate_task_consistency(state)
+        if task_errors:
+            logger.error(f"Task consistency errors: {task_errors}")
             return False
-
-        # All agents in completed/failed should have been in active_tasks
-        all_task_agents = (
-            set(state["active_tasks"].keys())
-            | state["completed_tasks"]
-            | state["failed_tasks"]
-        )
-        for agent_name in state["completed_tasks"] | state["failed_tasks"]:
-            if agent_name not in state["agent_states"]:
-                logger.error(
-                    f"Completed/failed task for non-existent agent: {agent_name}"
-                )
-                return False
 
         return True
 
@@ -397,28 +629,35 @@ def get_state_debug_info(state: GroupChatState) -> Dict[str, Any]:
     message_ids = [msg.message_id for msg in state["messages"]]
     unique_ids = set(message_ids)
 
+    # Enhanced task status information
+    active_tasks = state.get("active_tasks", {})
+    task_status_summary = {}
+    for agent_name, task_info in active_tasks.items():
+        task_status_summary[f"{agent_name}_task_status"] = {
+            "status": task_info.status,
+            "is_finished": task_info.is_finished(),
+            "duration": task_info.get_duration(),
+            "retry_count": task_info.retry_count,
+        }
+
     return {
         "total_messages": len(state["messages"]),
         "unique_messages": len(unique_ids),
         "duplicate_count": len(message_ids) - len(unique_ids),
         "agent_cursors": {
-            name: {
-                "cursor": agent_state.cursor,
-                "personal_history_length": len(agent_state.personal_history),
-                "turn_finished": agent_state.turn_finished,
-                "has_task": agent_state.current_task is not None,
-                "continuation_attempts": agent_state.continuation_attempts,
-            }
+            name: agent_state.get_state_summary()
             for name, agent_state in state["agent_states"].items()
         },
         "active_task_count": len(state["active_tasks"]),
         "active_tasks": list(state["active_tasks"].keys()),
+        "task_status_details": task_status_summary,
         "completed_count": len(state["completed_tasks"]),
         "completed_tasks": list(state["completed_tasks"]),
         "failed_count": len(state["failed_tasks"]),
         "failed_tasks": list(state["failed_tasks"]),
         "round_number": state.get("round_number", 0),
         "error_count": state.get("error_count", 0),
+        "validation_passed": apply_state_validation(state, "(debug info generation)"),
     }
 
 
@@ -447,3 +686,64 @@ def deduplicate_messages(state: GroupChatState) -> None:
     if removed_count > 0:
         logger.warning(f"Removed {removed_count} duplicate messages from state")
         state["messages"] = unique_messages
+
+
+def get_task_completion_summary(state: GroupChatState) -> Dict[str, Any]:
+    """
+    Get a comprehensive summary of task completion status.
+
+    This is useful for debugging concurrent execution and routing decisions.
+
+    Args:
+        state: The global state
+
+    Returns:
+        Dictionary with detailed completion information
+    """
+    active_tasks = state.get("active_tasks", {})
+
+    if not active_tasks:
+        return {"total_tasks": 0, "has_tasks": False, "completion_status": "no_tasks"}
+
+    # Categorize tasks by status
+    completed_agents = [
+        name for name, task in active_tasks.items() if task.is_successful()
+    ]
+    failed_agents = [
+        name for name, task in active_tasks.items() if task.status == "failed"
+    ]
+    in_progress_agents = [
+        name for name, task in active_tasks.items() if task.is_in_progress()
+    ]
+    pending_agents = [name for name, task in active_tasks.items() if task.is_pending()]
+
+    total_count = len(active_tasks)
+    finished_count = len(completed_agents) + len(failed_agents)
+
+    # Determine overall completion status
+    if finished_count == 0:
+        completion_status = "none_finished"
+    elif finished_count == total_count:
+        completion_status = "all_finished"
+    else:
+        completion_status = "partially_finished"
+
+    return {
+        "total_tasks": total_count,
+        "has_tasks": True,
+        "completion_status": completion_status,
+        "completed_count": len(completed_agents),
+        "failed_count": len(failed_agents),
+        "in_progress_count": len(in_progress_agents),
+        "pending_count": len(pending_agents),
+        "finished_count": finished_count,
+        "completion_percentage": (finished_count / total_count * 100)
+        if total_count > 0
+        else 0,
+        "completed_agents": completed_agents,
+        "failed_agents": failed_agents,
+        "in_progress_agents": in_progress_agents,
+        "pending_agents": pending_agents,
+        "all_finished": finished_count == total_count,
+        "ready_for_orchestrator": finished_count == total_count and total_count > 0,
+    }

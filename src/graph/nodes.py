@@ -1,16 +1,21 @@
-"""Enhanced LangGraph nodes with subgraph-based orchestrator and aggregator."""
+"""Enhanced LangGraph nodes with subgraph-based orchestrator and robust batch aggregation."""
 
-from typing import Callable, List, Dict, Any
+from typing import Callable, Dict, Any
 from datetime import datetime
-from functools import partial
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.configs.models import AgentConfig, TeamConfig
 
-from .state import GroupChatState, TaskInfo, get_agent_state, get_state_debug_info
+from .state import (
+    GroupChatState,
+    TaskInfo,
+    get_agent_state,
+    get_state_debug_info,
+    get_task_completion_summary,
+    apply_state_validation,
+)
 from .personalizer import personalizer
 from .messages import (
     from_langchain_messages,
@@ -20,7 +25,6 @@ from .messages import (
 )
 from src.core.logging import get_logger
 from src.core.exceptions import AgentError
-from src.configs.settings import settings
 
 logger = get_logger(__name__)
 
@@ -193,6 +197,13 @@ class OrchestratorSubgraph:
                 updates["completed_tasks"] = set()
                 updates["failed_tasks"] = set()
 
+            logger.info(
+                "Orchestrator response processed",
+                messages_count=len(messages_to_add),
+                active_tasks_count=len(active_tasks),
+                round_number=updates["round_number"],
+            )
+
             return updates
 
         except Exception as e:
@@ -276,8 +287,8 @@ def create_agent_node(agent_subgraph: StateGraph, agent_name: str) -> Callable:
                 agent_logger.warning("No active task found")
                 return {}
 
-            # Update task status
-            task_info.status = "in_progress"
+            # Update task status to in_progress
+            task_info.mark_in_progress()
 
             agent_logger.info(
                 "Executing agent subgraph", task=task_info.task_description[:100]
@@ -301,10 +312,9 @@ def create_agent_node(agent_subgraph: StateGraph, agent_name: str) -> Callable:
         except Exception as e:
             agent_logger.error("Agent subgraph execution failed", error=str(e))
 
-            # Update task status
+            # Mark task as failed in the task info
             if task_info:
-                task_info.status = "failed"
-                task_info.error_message = str(e)
+                task_info.mark_failed(str(e))
 
             # Create error message
             from .messages import AgentMessage
@@ -318,6 +328,7 @@ def create_agent_node(agent_subgraph: StateGraph, agent_name: str) -> Callable:
             return {
                 "messages": [error_message],
                 "failed_tasks": {agent_name},
+                "active_tasks": {agent_name: task_info} if task_info else {},
                 "error_count": state.get("error_count", 0) + 1,
             }
 
@@ -326,99 +337,127 @@ def create_agent_node(agent_subgraph: StateGraph, agent_name: str) -> Callable:
 
 def aggregator_node(state: GroupChatState) -> Dict[str, Any]:
     """
-    Enhanced aggregator node that properly tracks all agent completions.
+    COMPLETELY REDESIGNED aggregator node that handles ALL agent completions in batch.
+
+    This is the core fix for the concurrent execution issue. Instead of relying on
+    message analysis, it examines TaskInfo status directly and processes ALL
+    completions in a single call.
     """
-    logger.info("Starting aggregator")
+    logger.info("Starting ENHANCED aggregator with batch completion processing")
 
-    # Check if we have any new messages
-    if not state.get("messages"):
-        logger.warning("No messages to aggregate")
+    # Get current task completion status
+    completion_summary = get_task_completion_summary(state)
+
+    # Log comprehensive status before processing
+    logger.info("Enhanced aggregator - BEFORE processing", **completion_summary)
+
+    # Early exit if no tasks
+    if not completion_summary["has_tasks"]:
+        logger.warning("No active tasks to aggregate")
         return {}
 
-    last_message = state["messages"][-1]
-
-    # Determine sender name
-    sender_name = None
-    if hasattr(last_message, "agent_name"):
-        sender_name = last_message.agent_name
-    elif isinstance(last_message, OrchestratorMessage):
-        sender_name = "orchestrator"
-
-    if not sender_name:
-        logger.debug("Could not determine sender name from last message")
-        return {}
-
-    # Skip aggregation for orchestrator messages (they handle their own state)
-    if sender_name == "orchestrator":
-        logger.debug("Skipping aggregation for orchestrator message")
-        return {}
-
-    # Update completion status for agent tasks
-    completed_tasks = state.get("completed_tasks", set()).copy()
-    failed_tasks = state.get("failed_tasks", set()).copy()
     active_tasks = state.get("active_tasks", {})
 
-    if sender_name in active_tasks:
-        task_info = active_tasks[sender_name]
+    # CRITICAL: Process ALL task statuses in batch, not just last message
+    completed_agents = []
+    failed_agents = []
+    in_progress_agents = []
+    pending_agents = []
 
-        # Check if task failed based on error indicators
-        has_error = False
-        if hasattr(last_message, "is_private") and last_message.is_private:
-            has_error = "error" in last_message.content.lower()
+    # Log detailed task analysis
+    logger.info("BATCH ANALYSIS - examining all task statuses:")
+    for agent_name, task_info in active_tasks.items():
+        status_summary = task_info.get_status_summary()
+        logger.info(f"  {agent_name}: {status_summary}")
 
-        # Check if this was an error message from the agent subgraph
-        if sender_name in state.get("failed_tasks", set()):
-            has_error = True
+        if task_info.is_successful():
+            completed_agents.append(agent_name)
+        elif task_info.status == "failed":
+            failed_agents.append(agent_name)
+        elif task_info.is_in_progress():
+            in_progress_agents.append(agent_name)
+        else:  # pending
+            pending_agents.append(agent_name)
 
-        # Check if the task was marked as failed
-        if hasattr(task_info, "status") and task_info.status == "failed":
-            has_error = True
+    # Update completion tracking sets for compatibility with existing router
+    completed_tasks = set(completed_agents)
+    failed_tasks = set(failed_agents)
 
-        if has_error:
-            failed_tasks.add(sender_name)
-            task_info.status = "failed"
-            logger.info("Agent task marked as failed", agent=sender_name)
-        else:
-            completed_tasks.add(sender_name)
-            task_info.status = "completed"
-            logger.info("Agent task marked as completed", agent=sender_name)
+    # Reset agent states for completed agents (important for next round)
+    for agent_name in completed_agents:
+        agent_state = get_agent_state(state, agent_name)
+        agent_state.reset_turn_state()
+        logger.info(f"Reset turn state for completed agent: {agent_name}")
 
-            # Reset the agent's turn state for next time
-            agent_state = get_agent_state(state, sender_name)
-            agent_state.reset_turn_state()
-
-    total_tasks = len(active_tasks)
-    completed_count = len(completed_tasks)
-    failed_count = len(failed_tasks)
-
+    # Log comprehensive aggregation results
     logger.info(
-        "Aggregator status",
-        completed=completed_count,
-        failed=failed_count,
-        total=total_tasks,
-        still_pending=total_tasks - completed_count - failed_count,
+        "ENHANCED aggregator - BATCH processing results",
+        total_tasks=len(active_tasks),
+        completed_agents=completed_agents,
+        completed_count=len(completed_agents),
+        failed_agents=failed_agents,
+        failed_count=len(failed_agents),
+        in_progress_agents=in_progress_agents,
+        in_progress_count=len(in_progress_agents),
+        pending_agents=pending_agents,
+        pending_count=len(pending_agents),
+        all_finished=len(completed_agents) + len(failed_agents) == len(active_tasks),
+        ready_for_orchestrator=len(completed_agents) + len(failed_agents)
+        == len(active_tasks)
+        and len(active_tasks) > 0,
     )
 
     # Build updates - only return what's changing
     updates = {}
 
-    if completed_tasks != state.get("completed_tasks", set()):
+    # Update completed/failed task sets if they've changed
+    current_completed = state.get("completed_tasks", set())
+    current_failed = state.get("failed_tasks", set())
+
+    if completed_tasks != current_completed:
         updates["completed_tasks"] = completed_tasks
+        logger.info(
+            f"Updating completed_tasks: {current_completed} -> {completed_tasks}"
+        )
 
-    if failed_tasks != state.get("failed_tasks", set()):
+    if failed_tasks != current_failed:
         updates["failed_tasks"] = failed_tasks
+        logger.info(f"Updating failed_tasks: {current_failed} -> {failed_tasks}")
 
-    # Update active_tasks with modified task info
-    if active_tasks and any(task.status != "pending" for task in active_tasks.values()):
-        # Return the full active_tasks dict since we modified task statuses
+    # Always return active_tasks to ensure task status updates are reflected
+    if active_tasks:
         updates["active_tasks"] = active_tasks
+
+    # Validate state consistency
+    if updates:
+        # Create a mock updated state for validation
+        test_state = state.copy()
+        test_state.update(updates)
+        validation_passed = apply_state_validation(
+            test_state, "after enhanced aggregator"
+        )
+
+        if not validation_passed:
+            logger.error("Enhanced aggregator produced invalid state updates!")
+        else:
+            logger.debug("Enhanced aggregator state updates validated successfully")
+
+    logger.info(
+        "Enhanced aggregator completed - returning updates",
+        update_keys=list(updates.keys()),
+        updates_summary={
+            "completed_tasks": list(updates.get("completed_tasks", [])),
+            "failed_tasks": list(updates.get("failed_tasks", [])),
+            "active_tasks_count": len(updates.get("active_tasks", {})),
+        },
+    )
 
     return updates
 
 
 class AgentSubgraph:
     """
-    Creates and manages an agent subgraph with cursor-based personalization and turn management.
+    Creates and manages an agent subgraph with cursor-based personalization and enhanced completion tracking.
     """
 
     def __init__(self, agent_config: AgentConfig, team_config: TeamConfig, react_agent):
@@ -667,13 +706,9 @@ class AgentSubgraph:
 
     def _extract_new_messages(self, state: GroupChatState) -> Dict[str, Any]:
         """
-        Extract and convert new messages for global history.
+        ENHANCED: Extract and convert new messages for global history, EXPLICITLY mark task completion.
 
-        Args:
-            state: Current global state
-
-        Returns:
-            Dict with new messages for global state
+        This is the CRITICAL fix - we explicitly mark the TaskInfo as completed here.
         """
         agent_state = get_agent_state(state, self.agent_name)
 
@@ -685,17 +720,37 @@ class AgentSubgraph:
             # Calculate original length before invocation
             original_length = len(agent_state.personal_history)
 
-            # Extract new messages
-            # new_lc_messages = personalizer.extract_new_messages_from_result(
-            #     agent_state.temp_new_history, original_length
-            # )
-
             # Convert to SynapseMessages for global history
             new_synapse_messages = from_langchain_messages(
                 agent_state.temp_new_history,  # Full history for context
                 self.agent_name,
                 original_length,  # Only extract new ones
             )
+
+            # CRITICAL FIX: Explicitly mark this agent's task as completed
+            active_tasks = state.get("active_tasks", {})
+            task_updates = {}
+
+            if self.agent_name in active_tasks:
+                task_info = active_tasks[self.agent_name]
+
+                # Mark task as completed (this is the key fix!)
+                task_info.mark_completed()
+                task_updates[self.agent_name] = task_info
+
+                self.logger.info(
+                    "EXPLICITLY marked agent task as COMPLETED",
+                    agent=self.agent_name,
+                    task_status=task_info.status,
+                    task_description=task_info.task_description[:100],
+                    completion_time=task_info.completed_at.isoformat()
+                    if task_info.completed_at
+                    else None,
+                )
+            else:
+                self.logger.warning(
+                    f"Agent {self.agent_name} not found in active_tasks during completion"
+                )
 
             # Clean up temp state and turn completion flags
             personalizer.reset_agent_temp_state(state, self.agent_name)
@@ -705,9 +760,10 @@ class AgentSubgraph:
             agent_state.continuation_attempts = 0  # Reset for next time
 
             self.logger.info(
-                "Successfully extracted new messages and completed turn",
+                "Successfully extracted new messages and COMPLETED task",
                 agent=self.agent_name,
                 new_messages_count=len(new_synapse_messages),
+                task_explicitly_marked_completed=self.agent_name in task_updates,
             )
 
             # Log message types for debugging
@@ -716,12 +772,43 @@ class AgentSubgraph:
                 "New message types", agent=self.agent_name, types=message_types
             )
 
-            return {"messages": new_synapse_messages}
+            # Build result with explicit task completion
+            result = {"messages": new_synapse_messages}
+            if task_updates:
+                result["active_tasks"] = task_updates
+
+            self.logger.info(
+                "Returning extracted messages and task updates",
+                agent=self.agent_name,
+                messages_count=len(new_synapse_messages),
+                active_tasks_count=len(task_updates),
+            )
+
+            return result
 
         except Exception as e:
             self.logger.error(
                 "Failed to extract new messages", agent=self.agent_name, error=str(e)
             )
+
+            # ENHANCED ERROR HANDLING: Mark task as failed
+            active_tasks = state.get("active_tasks", {})
+            task_updates = {}
+            failed_tasks = set()
+
+            if self.agent_name in active_tasks:
+                task_info = active_tasks[self.agent_name]
+                task_info.mark_failed(str(e))
+                task_updates[self.agent_name] = task_info
+                failed_tasks.add(self.agent_name)
+
+                self.logger.error(
+                    "Marked agent task as FAILED due to extraction error",
+                    agent=self.agent_name,
+                    error_message=str(e),
+                    task_status=task_info.status,
+                )
+
             # Clean up temp state even on error
             personalizer.reset_agent_temp_state(state, self.agent_name)
 
@@ -729,7 +816,14 @@ class AgentSubgraph:
             agent_state.turn_finished = True
             agent_state.continuation_attempts = 0
 
-            raise AgentError(self.agent_name, f"Failed to extract new messages: {e}", e)
+            # Return error state with task marked as failed
+            result = {"messages": [], "error_count": state.get("error_count", 0) + 1}
+            if task_updates:
+                result["active_tasks"] = task_updates
+            if failed_tasks:
+                result["failed_tasks"] = failed_tasks
+
+            return result
 
     def _route_after_turn_check(self, state: GroupChatState) -> str:
         """

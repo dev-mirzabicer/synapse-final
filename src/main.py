@@ -1,4 +1,4 @@
-"""Enhanced main application with cursor-based state management and subgraph support."""
+"""Enhanced main application with cursor-based state management, subgraph support, and robust concurrent execution."""
 
 import dotenv
 
@@ -19,6 +19,8 @@ from src.graph.state import (
     validate_state_consistency,
     get_state_debug_info,
     deduplicate_messages,
+    get_task_completion_summary,
+    apply_state_validation,
 )
 from src.graph.messages import SynapseHumanMessage
 from src.core.logging import configure_logging, get_logger
@@ -38,7 +40,7 @@ logger = get_logger(__name__)
 
 
 class ConversationManager:
-    """Enhanced conversation manager with cursor-based state management."""
+    """Enhanced conversation manager with cursor-based state management and robust concurrent execution."""
 
     def __init__(self, team_config_path: Path):
         self.team_config_path = team_config_path
@@ -47,13 +49,15 @@ class ConversationManager:
         self.checkpointer = MemorySaver()
         self.team_config = None
         self._enable_debug = settings.log_level == "DEBUG"
+        self._enable_validation = True  # Enhanced validation
         self._initialize_graph()
 
     def _initialize_graph(self):
         """Initialize the enhanced graph with error handling."""
         try:
             logger.info(
-                "Initializing enhanced graph", config=str(self.team_config_path)
+                "Initializing enhanced graph with concurrent execution support",
+                config=str(self.team_config_path),
             )
 
             # Load team config for agent names
@@ -62,7 +66,16 @@ class ConversationManager:
             # Build the enhanced graph
             self.graph = build_graph(self.team_config_path, self.checkpointer)
 
-            logger.info("Enhanced graph initialized successfully")
+            logger.info(
+                "Enhanced graph initialized successfully",
+                features=[
+                    "cursor_based_state",
+                    "subgraph_architecture",
+                    "batch_completion_processing",
+                    "explicit_task_tracking",
+                    "state_validation",
+                ],
+            )
 
         except Exception as e:
             logger.error("Failed to initialize enhanced graph", error=str(e))
@@ -74,14 +87,26 @@ class ConversationManager:
             config_data = json.loads(self.team_config_path.read_text())
             self.team_config = TeamConfig(**config_data)
             logger.info(
-                "Team configuration loaded", team_name=self.team_config.team_name
+                "Team configuration loaded",
+                team_name=self.team_config.team_name,
+                agent_count=len(self.team_config.agents),
+                agents=[agent.name for agent in self.team_config.agents],
             )
         except Exception as e:
             raise SynapseError(f"Failed to load team configuration: {e}")
 
     def process_message(self, user_input: str) -> str:
-        """Process a user message and return response."""
+        """Process a user message and return response with enhanced monitoring."""
         start_time = time.time()
+
+        # Enhanced execution metrics
+        execution_metrics = {
+            "start_time": start_time,
+            "validation_checkpoints": 0,
+            "state_consistency_checks": 0,
+            "concurrent_execution_detected": False,
+            "task_completion_events": [],
+        }
 
         try:
             # Get agent names for state initialization
@@ -94,20 +119,29 @@ class ConversationManager:
                 conversation_id=self.conversation_id,
             )
 
-            # Validate initial state
-            if not validate_state_consistency(initial_state):
-                logger.warning("Initial state validation failed - attempting to fix")
-                # Try to fix by deduplicating
-                deduplicate_messages(initial_state)
+            # Enhanced initial state validation
+            if self._enable_validation:
+                validation_passed = apply_state_validation(
+                    initial_state, "initial state creation"
+                )
+                execution_metrics["validation_checkpoints"] += 1
 
-                if not validate_state_consistency(initial_state):
-                    logger.error("Could not fix initial state consistency")
+                if not validation_passed:
+                    logger.warning(
+                        "Initial state validation failed - attempting to fix"
+                    )
+                    deduplicate_messages(initial_state)
+
+                    # Re-validate after fix attempt
+                    if not apply_state_validation(
+                        initial_state, "after deduplication fix"
+                    ):
+                        logger.error("Could not fix initial state consistency")
 
             # Log initial state if debug enabled
             if self._enable_debug:
-                logger.debug(
-                    "Initial state debug info", **get_state_debug_info(initial_state)
-                )
+                debug_info = get_state_debug_info(initial_state)
+                logger.debug("Initial state debug info", **debug_info)
 
             # Configure for conversation
             config = {
@@ -116,69 +150,184 @@ class ConversationManager:
             }
 
             logger.info(
-                "Processing message with enhanced system",
+                "Processing message with ENHANCED concurrent execution system",
                 input_length=len(user_input),
                 conversation_id=self.conversation_id,
                 agent_count=len(agent_names),
                 initial_message_count=len(initial_state["messages"]),
+                enhanced_features_enabled=[
+                    "batch_aggregation",
+                    "explicit_completion_tracking",
+                    "taskinfo_based_routing",
+                    "state_validation",
+                ],
             )
 
-            # Invoke enhanced graph
-            final_state = self.graph.invoke(initial_state, config)
+            # Invoke enhanced graph with monitoring
+            final_state = self._invoke_graph_with_monitoring(
+                initial_state, config, execution_metrics
+            )
 
-            # Apply deduplication as a safety measure
-            pre_dedup_count = len(final_state.get("messages", []))
-            deduplicate_messages(final_state)
-            post_dedup_count = len(final_state.get("messages", []))
-
-            if pre_dedup_count != post_dedup_count:
-                logger.warning(
-                    f"Deduplication removed {pre_dedup_count - post_dedup_count} messages"
-                )
-
-            # Validate final state
-            if not validate_state_consistency(final_state):
-                logger.warning("Final state validation failed")
-                # Log detailed debug info
-                if self._enable_debug:
-                    logger.debug(
-                        "Final state debug info after issues",
-                        **get_state_debug_info(final_state),
-                    )
+            # Enhanced post-execution validation and cleanup
+            final_state = self._post_execution_validation(
+                final_state, execution_metrics
+            )
 
             # Extract response from final state
             response = self._extract_response(final_state)
 
-            # Calculate execution time
+            # Calculate execution time and log comprehensive metrics
             execution_time = time.time() - start_time
+            execution_metrics["total_execution_time"] = execution_time
 
-            logger.info(
-                "Message processed successfully with enhanced system",
-                response_length=len(response),
-                round_count=final_state.get("round_number", 0),
-                error_count=final_state.get("error_count", 0),
-                total_messages=len(final_state.get("messages", [])),
-                unique_messages=len(
-                    set(msg.message_id for msg in final_state.get("messages", []))
-                ),
-                execution_time_seconds=f"{execution_time:.2f}",
-            )
-
-            # Log final state debug info
-            if self._enable_debug:
-                logger.debug(
-                    "Final state debug info", **get_state_debug_info(final_state)
-                )
+            self._log_execution_metrics(final_state, execution_metrics, response)
 
             return response
 
         except Exception as e:
+            execution_time = time.time() - start_time
             logger.error(
                 "Failed to process message with enhanced system",
                 error=str(e),
-                execution_time_seconds=f"{time.time() - start_time:.2f}",
+                execution_time_seconds=f"{execution_time:.2f}",
+                execution_metrics=execution_metrics,
             )
             return f"I encountered an error: {str(e)}. Please try again."
+
+    def _invoke_graph_with_monitoring(
+        self, initial_state, config, execution_metrics
+    ) -> Dict[str, Any]:
+        """Invoke graph with enhanced monitoring for concurrent execution."""
+
+        # Detect if concurrent execution is expected
+        initial_completion = get_task_completion_summary(initial_state)
+        if initial_completion["total_tasks"] > 1:
+            execution_metrics["concurrent_execution_detected"] = True
+            logger.info(
+                "CONCURRENT EXECUTION DETECTED - enhanced monitoring enabled",
+                task_count=initial_completion["total_tasks"],
+                expected_agents=initial_completion.get("pending_agents", []),
+            )
+
+        # Invoke enhanced graph
+        final_state = self.graph.invoke(initial_state, config)
+
+        # Post-invocation analysis
+        final_completion = get_task_completion_summary(final_state)
+        execution_metrics["task_completion_events"] = final_completion
+
+        logger.info(
+            "Graph invocation completed",
+            concurrent_execution_occurred=execution_metrics[
+                "concurrent_execution_detected"
+            ],
+            final_completion_status=final_completion["completion_status"],
+            **final_completion,
+        )
+
+        return final_state
+
+    def _post_execution_validation(
+        self, final_state, execution_metrics
+    ) -> Dict[str, Any]:
+        """Enhanced post-execution validation and cleanup."""
+
+        # Apply deduplication as a safety measure
+        pre_dedup_count = len(final_state.get("messages", []))
+        deduplicate_messages(final_state)
+        post_dedup_count = len(final_state.get("messages", []))
+
+        if pre_dedup_count != post_dedup_count:
+            logger.warning(
+                f"Post-execution deduplication removed {pre_dedup_count - post_dedup_count} messages"
+            )
+
+        # Enhanced final state validation
+        if self._enable_validation:
+            validation_passed = apply_state_validation(final_state, "final state")
+            execution_metrics["validation_checkpoints"] += 1
+            execution_metrics["final_validation_passed"] = validation_passed
+
+            if not validation_passed:
+                logger.warning("Final state validation failed")
+                # Log detailed debug info for troubleshooting
+                if self._enable_debug:
+                    logger.debug(
+                        "Final state debug info after validation failure",
+                        **get_state_debug_info(final_state),
+                    )
+            else:
+                logger.debug("Final state validation passed successfully")
+
+        # Validate task completion consistency for concurrent execution
+        if execution_metrics.get("concurrent_execution_detected", False):
+            self._validate_concurrent_completion(final_state, execution_metrics)
+
+        return final_state
+
+    def _validate_concurrent_completion(self, final_state, execution_metrics):
+        """Validate that concurrent task execution completed properly."""
+
+        completion_summary = get_task_completion_summary(final_state)
+
+        logger.info("CONCURRENT EXECUTION VALIDATION", **completion_summary)
+
+        # Check for common concurrent execution issues
+        if (
+            completion_summary["has_tasks"]
+            and completion_summary["completion_status"] == "none_finished"
+        ):
+            logger.error(
+                "CONCURRENT EXECUTION ISSUE: Tasks were assigned but none finished",
+                active_tasks=completion_summary.get("total_tasks", 0),
+            )
+        elif completion_summary["completion_status"] == "partially_finished":
+            logger.warning(
+                "CONCURRENT EXECUTION: Some tasks may not have completed",
+                completion_percentage=completion_summary.get(
+                    "completion_percentage", 0
+                ),
+                completed_agents=completion_summary.get("completed_agents", []),
+                still_working=completion_summary.get("in_progress_agents", [])
+                + completion_summary.get("pending_agents", []),
+            )
+        else:
+            logger.info("CONCURRENT EXECUTION: All tasks completed successfully")
+
+        execution_metrics["concurrent_completion_status"] = completion_summary[
+            "completion_status"
+        ]
+
+    def _log_execution_metrics(self, final_state, execution_metrics, response):
+        """Log comprehensive execution metrics."""
+
+        logger.info(
+            "ENHANCED message processing completed",
+            response_length=len(response),
+            round_count=final_state.get("round_number", 0),
+            error_count=final_state.get("error_count", 0),
+            total_messages=len(final_state.get("messages", [])),
+            unique_messages=len(
+                set(msg.message_id for msg in final_state.get("messages", []))
+            ),
+            execution_time_seconds=f"{execution_metrics['total_execution_time']:.2f}",
+            validation_checkpoints=execution_metrics.get("validation_checkpoints", 0),
+            concurrent_execution_detected=execution_metrics.get(
+                "concurrent_execution_detected", False
+            ),
+            final_validation_passed=execution_metrics.get(
+                "final_validation_passed", "not_run"
+            ),
+            concurrent_completion_status=execution_metrics.get(
+                "concurrent_completion_status", "n/a"
+            ),
+        )
+
+        # Log final state debug info if debug enabled
+        if self._enable_debug:
+            logger.debug(
+                "Final execution state debug info", **get_state_debug_info(final_state)
+            )
 
     def _extract_response(self, final_state) -> str:
         """
@@ -224,6 +373,12 @@ class ConversationManager:
                     continue
 
                 # Found a good message
+                logger.debug(
+                    "Extracted response from message",
+                    message_type=type(message).__name__,
+                    content_preview=content[:100],
+                    agent_name=getattr(message, "agent_name", "unknown"),
+                )
                 return content
 
         # Fallback: try to find any orchestrator message
@@ -231,11 +386,13 @@ class ConversationManager:
             if hasattr(message, "content") and isinstance(message, type(messages[0])):
                 if "orchestrator" in str(type(message).__name__).lower():
                     if message.content:
+                        logger.debug("Extracted response from orchestrator fallback")
                         return message.content
 
         # Last resort: return the last message content if it exists
         last_message = messages[-1]
         if hasattr(last_message, "content") and last_message.content:
+            logger.debug("Extracted response from last message fallback")
             return last_message.content
 
         return "I completed the task but didn't generate a visible response."
@@ -252,28 +409,40 @@ class ConversationManager:
             "graph_initialized": self.graph is not None,
             "checkpointer_type": type(self.checkpointer).__name__,
             "debug_enabled": self._enable_debug,
+            "validation_enabled": self._enable_validation,
+            "enhanced_features": [
+                "cursor_based_state_management",
+                "batch_completion_processing",
+                "explicit_task_tracking",
+                "concurrent_execution_support",
+                "comprehensive_state_validation",
+                "enhanced_error_handling",
+            ],
         }
 
         return stats
 
 
 def run_interactive_chat(team_config_path: Path):
-    """Run enhanced interactive chat session."""
+    """Run enhanced interactive chat session with concurrent execution support."""
     try:
         conversation_manager = ConversationManager(team_config_path)
 
         # Display startup information
         stats = conversation_manager.get_conversation_stats()
 
-        print("-" * 80)
-        print("🤖 Enhanced Multi-Agent Group Chat (Synapse)")
+        print("-" * 90)
+        print("🤖 ENHANCED Multi-Agent Group Chat (Synapse)")
         print(f"Team: {stats['team_name']}")
         print(f"Agents: {stats['agent_count']} ({', '.join(stats['agent_names'])})")
         print(f"Conversation ID: {stats['conversation_id']}")
         print(f"Debug Mode: {'Enabled' if stats['debug_enabled'] else 'Disabled'}")
-        print("Features: Cursor-based state, Subgraphs, Message deduplication")
-        print("Type 'quit' or 'exit' to end the session")
-        print("-" * 80)
+        print(f"Validation: {'Enabled' if stats['validation_enabled'] else 'Disabled'}")
+        print("🚀 ENHANCED FEATURES:")
+        for feature in stats["enhanced_features"]:
+            print(f"  ✓ {feature.replace('_', ' ').title()}")
+        print("💡 Commands: 'quit'/'exit' to end, '/stats' for statistics")
+        print("-" * 90)
 
         while True:
             try:
@@ -288,15 +457,20 @@ def run_interactive_chat(team_config_path: Path):
 
                 # Special commands
                 if user_input.lower() == "/stats":
-                    print("\n📊 Conversation Statistics:")
+                    print("\n📊 Enhanced Conversation Statistics:")
                     for (
                         key,
                         value,
                     ) in conversation_manager.get_conversation_stats().items():
-                        print(f"  {key}: {value}")
+                        if isinstance(value, list) and len(value) > 3:
+                            print(
+                                f"  {key}: [{', '.join(map(str, value[:3]))}, ... ({len(value)} total)]"
+                            )
+                        else:
+                            print(f"  {key}: {value}")
                     continue
 
-                print("\n🤔 Processing with enhanced system...")
+                print("\n🔄 Processing with ENHANCED concurrent execution system...")
                 response = conversation_manager.process_message(user_input)
                 print(f"\n🤖 Response: {response}")
 
@@ -315,7 +489,7 @@ def run_interactive_chat(team_config_path: Path):
 
 def validate_config_file(config_path: Path) -> bool:
     """
-    Validate the team configuration file.
+    Validate the team configuration file with enhanced checks.
 
     Args:
         config_path: Path to configuration file
@@ -348,6 +522,13 @@ def validate_config_file(config_path: Path) -> bool:
             print(f"❌ Agents using reserved names: {conflicts}")
             return False
 
+        # Enhanced validation for concurrent execution
+        if len(agent_names) > 1:
+            print(
+                "✅ Multi-agent configuration detected - concurrent execution support enabled"
+            )
+
+        print("✅ Enhanced validation passed - ready for robust concurrent execution")
         return True
 
     except Exception as e:
@@ -356,9 +537,9 @@ def validate_config_file(config_path: Path) -> bool:
 
 
 def main():
-    """Enhanced main entry point."""
+    """Enhanced main entry point with concurrent execution support."""
     parser = argparse.ArgumentParser(
-        description="Enhanced Multi-Agent Group Chat using LangGraph with Subgraphs",
+        description="ENHANCED Multi-Agent Group Chat using LangGraph with Robust Concurrent Execution",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -384,6 +565,12 @@ def main():
         type=str,
         help="Run with a single test message and exit",
     )
+    parser.add_argument(
+        "--enable-validation",
+        action="store_true",
+        default=True,
+        help="Enable enhanced state validation (default: enabled)",
+    )
 
     args = parser.parse_args()
 
@@ -405,22 +592,30 @@ def main():
         sys.exit(1)
 
     if args.validate_only:
-        print("✅ Configuration validation complete")
+        print("✅ Enhanced configuration validation complete")
         return
 
     logger.info(
-        "Starting enhanced application",
+        "Starting ENHANCED application with concurrent execution support",
         config_file=str(args.config),
         log_level=settings.log_level,
+        validation_enabled=args.enable_validation,
+        enhanced_features=[
+            "batch_completion_processing",
+            "explicit_task_tracking",
+            "taskinfo_based_routing",
+            "comprehensive_state_validation",
+            "concurrent_execution_monitoring",
+        ],
     )
 
     try:
         # Test mode
         if args.test_message:
-            print(f"🧪 Running test with message: {args.test_message}")
+            print(f"🧪 Running enhanced test with message: {args.test_message}")
             conversation_manager = ConversationManager(args.config)
             response = conversation_manager.process_message(args.test_message)
-            print(f"🤖 Response: {response}")
+            print(f"🤖 Enhanced Response: {response}")
             return
 
         # Interactive mode

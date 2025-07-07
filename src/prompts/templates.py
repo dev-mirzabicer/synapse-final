@@ -52,7 +52,7 @@ The list of team members (you should use their name exactly while assigning task
 One important detail is that agents can not send a message after your message unless you assign a task to them, even if you assigned a task to them in a previous message.
 Sometimes, the agents make the mistake of saying "I will return to you with the results" and then giving the turn to you. In that case, if you simply say "Okay, I am awaiting your results" and leave it there, you will not receive the results because that will end the turn and return to the user. Therefore, if such a thing happens, you can still say "Okay, I am awaiting your results", but *you should again assign a task to the corresponding agent*, setting the task description to something like "Continue with your task" or simply leaving it empty.
 
-Similarly, if for any reason you write a message to the chat without assigning any tasks to anyone, the turn will end and the user's input will be required. Thus, only send a task-free message when you want the user's input.
+Similarly, if for any reason you write a message to the chat without assigning any tasks to anyone, the turn will end and the user's input will be required. Thus, only send a task-free message when you want the user's input. Remember this as a crucial detail: Unless you want to end the turn and thus return to the user, **you must assign a task to at least one agent in your message**.
 
 "Assigning a task" doesn't have to be an actual task. Think of assigning a task as giving a microphone to the agent. So you can simply set the task description to an empty string when you want an agent to talk without a task. An absurd example would be "Hi, Agent X, how are you?" with an empty task given to Agent X.
 """

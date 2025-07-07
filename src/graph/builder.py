@@ -1,4 +1,4 @@
-"""Enhanced graph builder with subgraph integration and cursor-based state management."""
+"""Enhanced graph builder with subgraph integration and robust cursor-based state management."""
 
 import json
 from pathlib import Path
@@ -12,7 +12,12 @@ from src.agents.factory import AgentFactory
 from src.core.logging import get_logger
 from src.core.exceptions import ConfigurationError
 from src.configs.settings import settings
-from .state import GroupChatState, get_state_debug_info
+from .state import (
+    GroupChatState,
+    get_state_debug_info,
+    get_task_completion_summary,
+    apply_state_validation,
+)
 from .nodes import create_orchestrator_node, create_agent_node, aggregator_node
 
 logger = get_logger(__name__)
@@ -200,7 +205,7 @@ class GraphBuilder:
         team_config: TeamConfig,
     ):
         """
-        Build the main graph workflow with subgraphs.
+        Build the main graph workflow with subgraphs and ENHANCED routing logic.
 
         Args:
             orchestrator_runnable: Orchestrator LLM runnable
@@ -241,29 +246,53 @@ class GraphBuilder:
         # Set entry point
         workflow.set_entry_point("orchestrator")
 
-        # Orchestrator routing
+        # ENHANCED Orchestrator routing
         def orchestrator_router(state: GroupChatState):
-            """Route from orchestrator based on active tasks."""
+            """ENHANCED route from orchestrator based on TaskInfo status."""
             active_tasks = state.get("active_tasks", {})
 
+            # Get comprehensive task status
+            completion_summary = get_task_completion_summary(state)
+
+            logger.info(
+                "ORCHESTRATOR ROUTER - analyzing task assignment", **completion_summary
+            )
+
             if not active_tasks:
-                logger.info("No active tasks, ending conversation")
+                logger.info("No active tasks assigned, ending conversation")
                 return END
 
-            # Only route to agents that have pending tasks
-            task_agents = []
+            # Only route to agents that have pending or in_progress tasks
+            agents_to_route = []
             for agent_name, task_info in active_tasks.items():
-                if task_info.status == "pending":
-                    task_agents.append(agent_name)
+                if task_info.status in ["pending", "in_progress"]:
+                    agents_to_route.append(agent_name)
+                    logger.info(
+                        f"Will route to agent {agent_name} (status: {task_info.status})",
+                        task_preview=task_info.task_description[:100],
+                    )
+                else:
+                    logger.info(
+                        f"NOT routing to agent {agent_name} (status: {task_info.status})"
+                    )
 
-            if not task_agents:
-                logger.info("No pending tasks, ending conversation")
+            if not agents_to_route:
+                logger.info(
+                    "No agents need to work (all finished), ending conversation"
+                )
                 return END
 
             logger.info(
-                "Routing to agents", agents=task_agents, task_count=len(task_agents)
+                "ORCHESTRATOR ROUTER DECISION - routing to agents",
+                agents=agents_to_route,
+                agent_count=len(agents_to_route),
+                total_tasks=len(active_tasks),
             )
-            return task_agents
+
+            # Validate state before routing
+            apply_state_validation(state, "before orchestrator routing")
+
+            return agents_to_route
 
         workflow.add_conditional_edges("orchestrator", orchestrator_router)
 
@@ -271,50 +300,89 @@ class GraphBuilder:
         for agent_name in agent_subgraphs.keys():
             workflow.add_edge(agent_name, "aggregator")
 
-        # Aggregator routing
+        # COMPLETELY REDESIGNED Aggregator routing based on TaskInfo status
         def aggregator_router(state: GroupChatState):
-            """Enhanced aggregator routing that waits for all agents."""
-            active_tasks = state.get("active_tasks", {})
-            completed_tasks = state.get("completed_tasks", set())
-            failed_tasks = state.get("failed_tasks", set())
+            """
+            ENHANCED aggregator routing using TaskInfo status as authoritative source.
 
-            if not active_tasks:
-                logger.info("No active tasks, ending conversation")
-                return END
+            This is the critical fix - instead of relying on fragile set logic,
+            we examine TaskInfo objects directly to make routing decisions.
+            """
+            # Get comprehensive completion summary
+            completion_summary = get_task_completion_summary(state)
 
-            # Agents that were assigned a task in this round
-            tasked_agents = set(active_tasks.keys())
-            # Agents that have finished their task (successfully or not)
-            finished_agents = completed_tasks | failed_tasks
-
+            # Log detailed routing analysis
             logger.info(
-                "Aggregator routing decision",
-                tasked_agents=list(tasked_agents),
-                finished_agents=list(finished_agents),
-                completed_count=len(completed_tasks),
-                failed_count=len(failed_tasks),
+                "AGGREGATOR ROUTER - comprehensive analysis", **completion_summary
             )
 
-            # If all assigned agents have finished, route back to orchestrator
-            if tasked_agents.issubset(finished_agents):
+            # Early exit if no tasks
+            if not completion_summary["has_tasks"]:
+                logger.info("AGGREGATOR ROUTER: No active tasks, ending conversation")
+                return END
+
+            # The key insight: use TaskInfo status as the authoritative source
+            active_tasks = state.get("active_tasks", {})
+
+            # Detailed analysis for logging
+            status_breakdown = {}
+            for agent_name, task_info in active_tasks.items():
+                status_breakdown[agent_name] = {
+                    "status": task_info.status,
+                    "is_finished": task_info.is_finished(),
+                    "duration": task_info.get_duration(),
+                    "task_preview": task_info.task_description[:50],
+                }
+
+            logger.info(
+                "AGGREGATOR ROUTER - detailed status breakdown",
+                status_breakdown=status_breakdown,
+            )
+
+            # Core routing logic based on completion_summary
+            if completion_summary["all_finished"]:
                 logger.info(
-                    "All agents have completed their tasks, routing back to orchestrator."
+                    "AGGREGATOR ROUTER DECISION: ALL agents finished - routing to ORCHESTRATOR",
+                    completed_agents=completion_summary["completed_agents"],
+                    failed_agents=completion_summary["failed_agents"],
+                    total_finished=completion_summary["finished_count"],
+                    total_tasks=completion_summary["total_tasks"],
                 )
+
+                # Validate state before routing back to orchestrator
+                validation_passed = apply_state_validation(
+                    state, "before routing to orchestrator"
+                )
+                if not validation_passed:
+                    logger.error(
+                        "State validation failed before routing to orchestrator!"
+                    )
+
                 return "orchestrator"
             else:
-                # Some agents are still running, so this branch should end.
-                # Another agent's branch will eventually trigger the aggregator again.
-                still_running = tasked_agents - finished_agents
+                # Some agents still working
+                still_working = [
+                    name
+                    for name, task in active_tasks.items()
+                    if not task.is_finished()
+                ]
+
                 logger.info(
-                    f"Waiting for other agents to complete: {list(still_running)}. Ending this branch."
+                    "AGGREGATOR ROUTER DECISION: Some agents still working - ENDING this branch",
+                    still_working_agents=still_working,
+                    still_working_count=len(still_working),
+                    finished_count=completion_summary["finished_count"],
+                    total_tasks=completion_summary["total_tasks"],
+                    completion_percentage=completion_summary["completion_percentage"],
                 )
+
                 return END
 
         workflow.add_conditional_edges(
             "aggregator", aggregator_router, {"orchestrator": "orchestrator", END: END}
         )
 
-        logger.info("Workflow structure built successfully")
+        logger.info("Enhanced workflow structure built successfully")
         return workflow
 
     def get_workflow_info(self, team_config: TeamConfig) -> Dict[str, Any]:
@@ -341,6 +409,9 @@ class GraphBuilder:
             "timeout_minutes": team_config.conversation_config.get(
                 "timeout_minutes", 30
             ),
+            "routing_logic": "enhanced_taskinfo_based",
+            "aggregation_mode": "batch_completion_processing",
+            "state_validation": "enabled",
         }
 
     def validate_team_config(self, team_config: TeamConfig) -> bool:
@@ -392,10 +463,13 @@ class GraphBuilder:
         """Log the compiled graph structure for debugging."""
         try:
             logger.debug(
-                "Graph structure",
+                "Enhanced graph structure",
                 nodes=list(graph.nodes.keys()) if hasattr(graph, "nodes") else "N/A",
                 agent_count=len(team_config.agents),
                 team_name=team_config.team_name,
+                routing_enhancements="TaskInfo-based routing enabled",
+                aggregation_enhancements="Batch completion processing enabled",
+                state_validation="Enabled throughout pipeline",
             )
         except Exception as e:
             logger.debug("Could not log graph structure", error=str(e))
