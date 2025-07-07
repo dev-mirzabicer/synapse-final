@@ -1,3 +1,5 @@
+"""Enhanced tools including turn management for multi-agent system."""
+
 from langchain_core.tools import tool
 from langchain_tavily import TavilySearch
 from typing import Dict, Annotated, List, Any
@@ -86,5 +88,34 @@ def get_default_tools() -> List[Any]:
     return [
         assign_tasks,
         search_web,
-        # Add more tools here as needed
+        # Removed finish_my_turn - agents now use [FINISH_TURN] in their messages
     ]
+
+
+def get_orchestrator_tools() -> List[Any]:
+    """Get the list of tools available specifically to the orchestrator."""
+    return [
+        assign_tasks,
+        search_web,
+    ]
+
+
+def get_agent_tools() -> List[Any]:
+    """Get the list of tools available to regular agents."""
+    return [
+        search_web,
+        # Removed finish_my_turn - agents now use [FINISH_TURN] in their messages
+    ]
+
+
+def extract_tool_call_names(tool_calls: List[Dict[str, Any]]) -> List[str]:
+    """
+    Extract tool names from a list of tool calls.
+
+    Args:
+        tool_calls: List of tool call dictionaries
+
+    Returns:
+        List of tool names that were called
+    """
+    return [tool_call.get("name", "unknown") for tool_call in tool_calls]
