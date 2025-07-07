@@ -129,6 +129,26 @@ def merge_agent_states(
     return merged
 
 
+def take_last_or_max(a: Any, b: Any) -> Any:
+    """Reducer for numeric values, takes the max. For others, takes the last value."""
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return max(a, b)
+    return b
+
+
+def unique(a: str, b: str) -> str:
+    """Reducer that checks for uniqueness of strings."""
+    if a == b:
+        return a
+    elif a is None:
+        return b
+    elif b is None:
+        return a
+    # Raise an error if values are not unique
+    logger.error(f"Values are not unique: {a} != {b}")
+    raise ValueError(f"Values are not unique: {a} != {b}")
+
+
 class GroupChatState(TypedDict):
     """Enhanced state for the group chat application with agent-specific states."""
 
@@ -147,16 +167,16 @@ class GroupChatState(TypedDict):
     failed_tasks: Annotated[Set[str], operator.or_]
     """Agent names whose tasks failed (union operation for sets)."""
 
-    round_number: int
+    round_number: Annotated[int, take_last_or_max]
     """Current orchestration round."""
 
-    error_count: int
+    error_count: Annotated[int, operator.add]
     """Total number of errors encountered."""
 
-    context: Dict[str, Any]
+    context: Annotated[Dict[str, Any], operator.or_]
     """Additional context for agents."""
 
-    conversation_id: Optional[str]
+    conversation_id: Annotated[Optional[str], unique]
     """Unique identifier for this conversation."""
 
 

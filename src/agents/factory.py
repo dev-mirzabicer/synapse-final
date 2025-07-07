@@ -138,7 +138,7 @@ class AgentFactory:
         try:
             # Create LLM for orchestrator
             llm = ChatGoogleGenerativeAI(
-                model="gemini-2.5-flash", temperature=0, api_key=settings.google_api_key
+                model="gemini-2.5-pro", temperature=0, api_key=settings.google_api_key
             )
 
             # Get orchestrator tools

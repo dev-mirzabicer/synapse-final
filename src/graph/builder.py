@@ -129,7 +129,7 @@ class GraphBuilder:
                 checkpointer = MemorySaver()
 
             graph = workflow.compile(
-                checkpointer=checkpointer, debug=self._enable_debug
+                checkpointer=checkpointer  # , debug=self._enable_debug
             )
 
             logger.info("Enhanced graph compiled successfully")
@@ -282,38 +282,33 @@ class GraphBuilder:
                 logger.info("No active tasks, ending conversation")
                 return END
 
-            # Calculate completion status
-            pending_tasks = []
-            for agent_name, task_info in active_tasks.items():
-                if task_info.status == "pending":
-                    pending_tasks.append(agent_name)
-
-            total_tasks = len(active_tasks)
-            total_completed = len(completed_tasks) + len(failed_tasks)
+            # Agents that were assigned a task in this round
+            tasked_agents = set(active_tasks.keys())
+            # Agents that have finished their task (successfully or not)
+            finished_agents = completed_tasks | failed_tasks
 
             logger.info(
                 "Aggregator routing decision",
-                total_tasks=total_tasks,
-                completed=len(completed_tasks),
-                failed=len(failed_tasks),
-                total_completed=total_completed,
-                pending_tasks=pending_tasks,
-                still_pending=len(pending_tasks),
+                tasked_agents=list(tasked_agents),
+                finished_agents=list(finished_agents),
+                completed_count=len(completed_tasks),
+                failed_count=len(failed_tasks),
             )
 
-            # If all tasks are complete (no pending), route back to orchestrator
-            if len(pending_tasks) == 0:
-                logger.info("All agents have completed, routing back to orchestrator")
+            # If all assigned agents have finished, route back to orchestrator
+            if tasked_agents.issubset(finished_agents):
+                logger.info(
+                    "All agents have completed their tasks, routing back to orchestrator."
+                )
                 return "orchestrator"
             else:
-                # Still have pending tasks
-                logger.warning(
-                    f"Aggregator called but {len(pending_tasks)} tasks still pending - "
-                    f"this suggests agent subgraph routing issues",
-                    pending_agents=pending_tasks,
+                # Some agents are still running, so this branch should end.
+                # Another agent's branch will eventually trigger the aggregator again.
+                still_running = tasked_agents - finished_agents
+                logger.info(
+                    f"Waiting for other agents to complete: {list(still_running)}. Ending this branch."
                 )
-                # Route back to orchestrator anyway to avoid getting stuck
-                return "orchestrator"
+                return END
 
         workflow.add_conditional_edges(
             "aggregator", aggregator_router, {"orchestrator": "orchestrator", END: END}
