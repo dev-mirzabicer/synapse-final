@@ -1,4 +1,4 @@
-"""Enhanced main application with cursor-based state management, subgraph support, and robust concurrent execution."""
+"""Enhanced main application with staged message processing, cursor-based state management, and robust concurrent execution."""
 
 import dotenv
 
@@ -21,6 +21,7 @@ from src.graph.state import (
     deduplicate_messages,
     get_task_completion_summary,
     apply_state_validation,
+    MessageMerger,
 )
 from src.graph.messages import SynapseHumanMessage
 from src.core.logging import configure_logging, get_logger
@@ -40,7 +41,7 @@ logger = get_logger(__name__)
 
 
 class ConversationManager:
-    """Enhanced conversation manager with cursor-based state management and robust concurrent execution."""
+    """Enhanced conversation manager with staged message processing and robust concurrent execution."""
 
     def __init__(self, team_config_path: Path):
         self.team_config_path = team_config_path
@@ -53,27 +54,31 @@ class ConversationManager:
         self._initialize_graph()
 
     def _initialize_graph(self):
-        """Initialize the enhanced graph with error handling."""
+        """Initialize the enhanced graph with staged message processing."""
         try:
             logger.info(
-                "Initializing enhanced graph with concurrent execution support",
+                "Initializing enhanced graph with staged message processing support",
                 config=str(self.team_config_path),
             )
 
             # Load team config for agent names
             self._load_team_config()
 
-            # Build the enhanced graph
+            # Build the enhanced graph with staged processing
             self.graph = build_graph(self.team_config_path, self.checkpointer)
 
             logger.info(
                 "Enhanced graph initialized successfully",
                 features=[
+                    "staged_message_processing",
+                    "pending_message_queue",
+                    "batch_message_merging",
                     "cursor_based_state",
                     "subgraph_architecture",
                     "batch_completion_processing",
                     "explicit_task_tracking",
-                    "state_validation",
+                    "comprehensive_state_validation",
+                    "enhanced_error_handling",
                 ],
             )
 
@@ -96,23 +101,25 @@ class ConversationManager:
             raise SynapseError(f"Failed to load team configuration: {e}")
 
     def process_message(self, user_input: str) -> str:
-        """Process a user message and return response with enhanced monitoring."""
+        """Process a user message and return response with enhanced staged processing monitoring."""
         start_time = time.time()
 
-        # Enhanced execution metrics
+        # Enhanced execution metrics with staged processing awareness
         execution_metrics = {
             "start_time": start_time,
             "validation_checkpoints": 0,
             "state_consistency_checks": 0,
             "concurrent_execution_detected": False,
             "task_completion_events": [],
+            "pending_message_events": [],
+            "message_merge_events": [],
         }
 
         try:
             # Get agent names for state initialization
             agent_names = [agent.name for agent in self.team_config.agents]
 
-            # Create initial state with enhanced state management
+            # Create initial state with staged message processing support
             initial_state = create_initial_state(
                 user_message=user_input,
                 agent_names=agent_names,
@@ -150,12 +157,16 @@ class ConversationManager:
             }
 
             logger.info(
-                "Processing message with ENHANCED concurrent execution system",
+                "Processing message with ENHANCED staged message processing system",
                 input_length=len(user_input),
                 conversation_id=self.conversation_id,
                 agent_count=len(agent_names),
                 initial_message_count=len(initial_state["messages"]),
+                initial_pending_count=len(initial_state.get("pending_messages", [])),
                 enhanced_features_enabled=[
+                    "staged_message_processing",
+                    "pending_message_queue",
+                    "batch_message_merging",
                     "batch_aggregation",
                     "explicit_completion_tracking",
                     "taskinfo_based_routing",
@@ -163,7 +174,7 @@ class ConversationManager:
                 ],
             )
 
-            # Invoke enhanced graph with monitoring
+            # Invoke enhanced graph with staged processing monitoring
             final_state = self._invoke_graph_with_monitoring(
                 initial_state, config, execution_metrics
             )
@@ -187,7 +198,7 @@ class ConversationManager:
         except Exception as e:
             execution_time = time.time() - start_time
             logger.error(
-                "Failed to process message with enhanced system",
+                "Failed to process message with enhanced staged processing system",
                 error=str(e),
                 execution_time_seconds=f"{execution_time:.2f}",
                 execution_metrics=execution_metrics,
@@ -197,7 +208,7 @@ class ConversationManager:
     def _invoke_graph_with_monitoring(
         self, initial_state, config, execution_metrics
     ) -> Dict[str, Any]:
-        """Invoke graph with enhanced monitoring for concurrent execution."""
+        """Invoke graph with enhanced monitoring for staged message processing and concurrent execution."""
 
         # Detect if concurrent execution is expected
         initial_completion = get_task_completion_summary(initial_state)
@@ -209,19 +220,39 @@ class ConversationManager:
                 expected_agents=initial_completion.get("pending_agents", []),
             )
 
-        # Invoke enhanced graph
+        # Monitor initial pending state
+        initial_pending = MessageMerger.get_pending_summary(initial_state)
+        execution_metrics["pending_message_events"].append(
+            {"phase": "initial", "summary": initial_pending}
+        )
+
+        # Invoke enhanced graph with staged processing
         final_state = self.graph.invoke(initial_state, config)
 
         # Post-invocation analysis
         final_completion = get_task_completion_summary(final_state)
         execution_metrics["task_completion_events"] = final_completion
 
+        final_pending = MessageMerger.get_pending_summary(final_state)
+        execution_metrics["pending_message_events"].append(
+            {"phase": "final", "summary": final_pending}
+        )
+
+        # Check if any pending messages remain (should be empty in final state)
+        if final_pending["pending_count"] > 0:
+            logger.warning(
+                "Final state contains unmerged pending messages",
+                pending_count=final_pending["pending_count"],
+                pending_sources=final_pending["pending_sources"],
+            )
+
         logger.info(
-            "Graph invocation completed",
+            "Graph invocation completed with staged processing",
             concurrent_execution_occurred=execution_metrics[
                 "concurrent_execution_detected"
             ],
             final_completion_status=final_completion["completion_status"],
+            final_pending_count=final_pending["pending_count"],
             **final_completion,
         )
 
@@ -230,16 +261,25 @@ class ConversationManager:
     def _post_execution_validation(
         self, final_state, execution_metrics
     ) -> Dict[str, Any]:
-        """Enhanced post-execution validation and cleanup."""
+        """Enhanced post-execution validation and cleanup with staged processing awareness."""
 
-        # Apply deduplication as a safety measure
-        pre_dedup_count = len(final_state.get("messages", []))
+        # Apply deduplication as a safety measure for both main and pending messages
+        pre_dedup_main = len(final_state.get("messages", []))
+        pre_dedup_pending = len(final_state.get("pending_messages", []))
+
         deduplicate_messages(final_state)
-        post_dedup_count = len(final_state.get("messages", []))
 
-        if pre_dedup_count != post_dedup_count:
+        post_dedup_main = len(final_state.get("messages", []))
+        post_dedup_pending = len(final_state.get("pending_messages", []))
+
+        if pre_dedup_main != post_dedup_main:
             logger.warning(
-                f"Post-execution deduplication removed {pre_dedup_count - post_dedup_count} messages"
+                f"Post-execution deduplication removed {pre_dedup_main - post_dedup_main} main messages"
+            )
+
+        if pre_dedup_pending != post_dedup_pending:
+            logger.warning(
+                f"Post-execution deduplication removed {pre_dedup_pending - post_dedup_pending} pending messages"
             )
 
         # Enhanced final state validation
@@ -259,11 +299,33 @@ class ConversationManager:
             else:
                 logger.debug("Final state validation passed successfully")
 
+        # Validate staged message processing completed properly
+        self._validate_staged_processing_completion(final_state, execution_metrics)
+
         # Validate task completion consistency for concurrent execution
         if execution_metrics.get("concurrent_execution_detected", False):
             self._validate_concurrent_completion(final_state, execution_metrics)
 
         return final_state
+
+    def _validate_staged_processing_completion(self, final_state, execution_metrics):
+        """Validate that staged message processing completed properly."""
+
+        pending_summary = MessageMerger.get_pending_summary(final_state)
+
+        logger.info("STAGED PROCESSING VALIDATION", **pending_summary)
+
+        # Check for unmerged pending messages
+        if pending_summary["pending_count"] > 0:
+            logger.warning(
+                "STAGED PROCESSING ISSUE: Final state has unmerged pending messages",
+                pending_count=pending_summary["pending_count"],
+                pending_sources=pending_summary["pending_sources"],
+            )
+            execution_metrics["staged_processing_issue"] = "unmerged_pending_messages"
+        else:
+            logger.info("STAGED PROCESSING: All messages properly merged")
+            execution_metrics["staged_processing_status"] = "completed_successfully"
 
     def _validate_concurrent_completion(self, final_state, execution_metrics):
         """Validate that concurrent task execution completed properly."""
@@ -299,14 +361,15 @@ class ConversationManager:
         ]
 
     def _log_execution_metrics(self, final_state, execution_metrics, response):
-        """Log comprehensive execution metrics."""
+        """Log comprehensive execution metrics with staged processing details."""
 
         logger.info(
-            "ENHANCED message processing completed",
+            "ENHANCED message processing completed with staged processing",
             response_length=len(response),
             round_count=final_state.get("round_number", 0),
             error_count=final_state.get("error_count", 0),
             total_messages=len(final_state.get("messages", [])),
+            total_pending_messages=len(final_state.get("pending_messages", [])),
             unique_messages=len(
                 set(msg.message_id for msg in final_state.get("messages", []))
             ),
@@ -321,17 +384,24 @@ class ConversationManager:
             concurrent_completion_status=execution_metrics.get(
                 "concurrent_completion_status", "n/a"
             ),
+            staged_processing_status=execution_metrics.get(
+                "staged_processing_status", "n/a"
+            ),
+            pending_message_events_count=len(
+                execution_metrics.get("pending_message_events", [])
+            ),
         )
 
         # Log final state debug info if debug enabled
         if self._enable_debug:
             logger.debug(
-                "Final execution state debug info", **get_state_debug_info(final_state)
+                "Final execution state debug info with staged processing",
+                **get_state_debug_info(final_state),
             )
 
     def _extract_response(self, final_state) -> str:
         """
-        Extract the final response from the enhanced state.
+        Extract the final response from the enhanced state with staged processing support.
 
         Args:
             final_state: The final state from graph execution
@@ -398,7 +468,7 @@ class ConversationManager:
         return "I completed the task but didn't generate a visible response."
 
     def get_conversation_stats(self) -> Dict[str, Any]:
-        """Get statistics about the current conversation."""
+        """Get statistics about the current conversation with staged processing details."""
         stats = {
             "conversation_id": self.conversation_id,
             "team_name": self.team_config.team_name if self.team_config else "Unknown",
@@ -411,6 +481,9 @@ class ConversationManager:
             "debug_enabled": self._enable_debug,
             "validation_enabled": self._enable_validation,
             "enhanced_features": [
+                "staged_message_processing",
+                "pending_message_queue",
+                "batch_message_merging",
                 "cursor_based_state_management",
                 "batch_completion_processing",
                 "explicit_task_tracking",
@@ -418,13 +491,15 @@ class ConversationManager:
                 "comprehensive_state_validation",
                 "enhanced_error_handling",
             ],
+            "message_processing_architecture": "staged_with_pending_queue",
+            "state_management_architecture": "cursor_based_with_validation",
         }
 
         return stats
 
 
 def run_interactive_chat(team_config_path: Path):
-    """Run enhanced interactive chat session with concurrent execution support."""
+    """Run enhanced interactive chat session with staged message processing and concurrent execution support."""
     try:
         conversation_manager = ConversationManager(team_config_path)
 
@@ -432,12 +507,16 @@ def run_interactive_chat(team_config_path: Path):
         stats = conversation_manager.get_conversation_stats()
 
         print("-" * 90)
-        print("🤖 ENHANCED Multi-Agent Group Chat (Synapse)")
+        print(
+            "🤖 ENHANCED Multi-Agent Group Chat (Synapse) - Staged Processing Edition"
+        )
         print(f"Team: {stats['team_name']}")
         print(f"Agents: {stats['agent_count']} ({', '.join(stats['agent_names'])})")
         print(f"Conversation ID: {stats['conversation_id']}")
         print(f"Debug Mode: {'Enabled' if stats['debug_enabled'] else 'Disabled'}")
         print(f"Validation: {'Enabled' if stats['validation_enabled'] else 'Disabled'}")
+        print(f"Message Processing: {stats['message_processing_architecture']}")
+        print(f"State Management: {stats['state_management_architecture']}")
         print("🚀 ENHANCED FEATURES:")
         for feature in stats["enhanced_features"]:
             print(f"  ✓ {feature.replace('_', ' ').title()}")
@@ -470,7 +549,9 @@ def run_interactive_chat(team_config_path: Path):
                             print(f"  {key}: {value}")
                     continue
 
-                print("\n🔄 Processing with ENHANCED concurrent execution system...")
+                print(
+                    "\n🔄 Processing with ENHANCED staged message processing system..."
+                )
                 response = conversation_manager.process_message(user_input)
                 print(f"\n🤖 Response: {response}")
 
@@ -489,7 +570,7 @@ def run_interactive_chat(team_config_path: Path):
 
 def validate_config_file(config_path: Path) -> bool:
     """
-    Validate the team configuration file with enhanced checks.
+    Validate the team configuration file with enhanced checks for staged processing.
 
     Args:
         config_path: Path to configuration file
@@ -522,13 +603,15 @@ def validate_config_file(config_path: Path) -> bool:
             print(f"❌ Agents using reserved names: {conflicts}")
             return False
 
-        # Enhanced validation for concurrent execution
+        # Enhanced validation for staged processing and concurrent execution
         if len(agent_names) > 1:
             print(
-                "✅ Multi-agent configuration detected - concurrent execution support enabled"
+                "✅ Multi-agent configuration detected - concurrent execution with staged processing enabled"
             )
 
-        print("✅ Enhanced validation passed - ready for robust concurrent execution")
+        print(
+            "✅ Enhanced validation passed - ready for robust staged message processing"
+        )
         return True
 
     except Exception as e:
@@ -537,9 +620,9 @@ def validate_config_file(config_path: Path) -> bool:
 
 
 def main():
-    """Enhanced main entry point with concurrent execution support."""
+    """Enhanced main entry point with staged message processing and concurrent execution support."""
     parser = argparse.ArgumentParser(
-        description="ENHANCED Multi-Agent Group Chat using LangGraph with Robust Concurrent Execution",
+        description="ENHANCED Multi-Agent Group Chat using LangGraph with Staged Message Processing",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -596,11 +679,14 @@ def main():
         return
 
     logger.info(
-        "Starting ENHANCED application with concurrent execution support",
+        "Starting ENHANCED application with staged message processing",
         config_file=str(args.config),
         log_level=settings.log_level,
         validation_enabled=args.enable_validation,
         enhanced_features=[
+            "staged_message_processing",
+            "pending_message_queue",
+            "batch_message_merging",
             "batch_completion_processing",
             "explicit_task_tracking",
             "taskinfo_based_routing",
@@ -612,7 +698,9 @@ def main():
     try:
         # Test mode
         if args.test_message:
-            print(f"🧪 Running enhanced test with message: {args.test_message}")
+            print(
+                f"🧪 Running enhanced test with staged processing: {args.test_message}"
+            )
             conversation_manager = ConversationManager(args.config)
             response = conversation_manager.process_message(args.test_message)
             print(f"🤖 Enhanced Response: {response}")

@@ -1,4 +1,4 @@
-"""Enhanced graph builder with subgraph integration and robust cursor-based state management."""
+"""Enhanced graph builder with subgraph integration, staged message processing, and robust cursor-based state management."""
 
 import json
 from pathlib import Path
@@ -17,6 +17,7 @@ from .state import (
     get_state_debug_info,
     get_task_completion_summary,
     apply_state_validation,
+    MessageMerger,
 )
 from .nodes import create_orchestrator_node, create_agent_node, aggregator_node
 
@@ -25,17 +26,16 @@ logger = get_logger(__name__)
 
 def debug_node_wrapper(node_func, node_name):
     """
-    Wrap node functions to debug their updates.
+    Wrap node functions to debug their updates with staged message processing awareness.
 
     This wrapper logs the state before and after each node execution,
-    helping to track down state management issues.
+    with special attention to pending message queues and staged processing.
     """
 
     def wrapped(state):
-        # Log input state
-        logger.debug(
-            f"[{node_name}] PRE-EXECUTION state stats", **get_state_debug_info(state)
-        )
+        # Log input state with pending message awareness
+        debug_info = get_state_debug_info(state)
+        logger.debug(f"[{node_name}] PRE-EXECUTION state stats", **debug_info)
 
         # Execute the node
         try:
@@ -44,23 +44,34 @@ def debug_node_wrapper(node_func, node_name):
             logger.error(
                 f"[{node_name}] Node execution failed",
                 error=str(e),
-                state_stats=get_state_debug_info(state),
+                state_stats=debug_info,
             )
             raise
 
-        # Log what the node is returning
+        # Log what the node is returning with staged processing details
         if result:
             updates_summary = {}
-            if "messages" in result:
-                updates_summary["new_messages"] = len(result.get("messages", []))
-                for i, msg in enumerate(result["messages"][:3]):  # Log first 3
+
+            # Track pending messages (new)
+            if "pending_messages" in result:
+                pending_count = len(result.get("pending_messages", []))
+                updates_summary["pending_messages"] = pending_count
+
+                # Log first few pending messages for debugging
+                for i, msg in enumerate(result["pending_messages"][:3]):
                     logger.debug(
-                        f"[{node_name}] New message {i}",
+                        f"[{node_name}] Pending message {i}",
                         msg_type=type(msg).__name__,
                         msg_id=getattr(msg, "message_id", "NO_ID")[:8],
                         content_preview=getattr(msg, "content", "")[:50],
                     )
 
+            # Track pending sources (new)
+            if "pending_sources" in result:
+                sources = result.get("pending_sources", {})
+                updates_summary["pending_sources"] = list(sources.keys())
+
+            # Track other updates
             if "active_tasks" in result:
                 updates_summary["active_tasks_update"] = list(
                     result["active_tasks"].keys()
@@ -89,7 +100,7 @@ def debug_node_wrapper(node_func, node_name):
 
 
 class GraphBuilder:
-    """Enhanced graph builder with subgraph integration and agent state management."""
+    """Enhanced graph builder with staged message processing and subgraph integration."""
 
     def __init__(self):
         self.agent_factory = AgentFactory()
@@ -97,7 +108,7 @@ class GraphBuilder:
 
     def build_graph(self, team_config_path: Path, checkpointer: Optional[Any] = None):
         """
-        Build and compile the enhanced LangGraph with subgraphs.
+        Build and compile the enhanced LangGraph with staged message processing.
 
         Args:
             team_config_path: Path to team configuration JSON
@@ -107,7 +118,8 @@ class GraphBuilder:
             Compiled LangGraph
         """
         logger.info(
-            "Building enhanced graph with subgraphs", config_path=str(team_config_path)
+            "Building enhanced graph with staged message processing",
+            config_path=str(team_config_path),
         )
 
         try:
@@ -124,7 +136,7 @@ class GraphBuilder:
             # Create agent subgraphs
             agent_subgraphs = self._create_agent_subgraphs(team_config)
 
-            # Build the workflow
+            # Build the workflow with staged message processing
             workflow = self._build_workflow(
                 orchestrator_runnable, agent_subgraphs, team_config
             )
@@ -133,11 +145,18 @@ class GraphBuilder:
             if checkpointer is None:
                 checkpointer = MemorySaver()
 
-            graph = workflow.compile(
-                checkpointer=checkpointer  # , debug=self._enable_debug
-            )
+            graph = workflow.compile(checkpointer=checkpointer)
 
-            logger.info("Enhanced graph compiled successfully")
+            logger.info(
+                "Enhanced graph compiled successfully with staged message processing",
+                features=[
+                    "staged_message_processing",
+                    "pending_message_queue",
+                    "batch_message_merging",
+                    "cursor_based_state",
+                    "subgraph_architecture",
+                ],
+            )
 
             # Log the graph structure for debugging
             if self._enable_debug:
@@ -164,7 +183,7 @@ class GraphBuilder:
 
     def _create_agent_subgraphs(self, team_config: TeamConfig) -> Dict[str, Any]:
         """
-        Create all agent subgraphs.
+        Create all agent subgraphs with staged message processing.
 
         Args:
             team_config: Team configuration
@@ -178,14 +197,15 @@ class GraphBuilder:
             try:
                 logger.info("Creating agent subgraph", name=agent_config.name)
 
-                # Create agent subgraph
+                # Create agent subgraph with staged processing
                 subgraph = self.agent_factory.create_agent_subgraph(
                     agent_config, team_config
                 )
                 agent_subgraphs[agent_config.name] = subgraph
 
                 logger.info(
-                    "Successfully created agent subgraph", name=agent_config.name
+                    "Successfully created agent subgraph with staged processing",
+                    name=agent_config.name,
                 )
 
             except Exception as e:
@@ -205,7 +225,7 @@ class GraphBuilder:
         team_config: TeamConfig,
     ):
         """
-        Build the main graph workflow with subgraphs and ENHANCED routing logic.
+        Build the main graph workflow with staged message processing and enhanced routing logic.
 
         Args:
             orchestrator_runnable: Orchestrator LLM runnable
@@ -213,11 +233,11 @@ class GraphBuilder:
             team_config: Team configuration
 
         Returns:
-            StateGraph workflow
+            StateGraph workflow with staged message processing
         """
         workflow = StateGraph(GroupChatState)
 
-        # Create orchestrator node
+        # Create orchestrator node with staged processing
         orchestrator_node = create_orchestrator_node(orchestrator_runnable)
 
         # Wrap nodes with debug logging if enabled
@@ -229,10 +249,10 @@ class GraphBuilder:
 
         workflow.add_node("orchestrator", orchestrator_node)
 
-        # Add aggregator node
+        # Add enhanced aggregator node with staged message processing
         workflow.add_node("aggregator", aggregator_node_wrapped)
 
-        # Add agent subgraph nodes
+        # Add agent subgraph nodes with staged processing
         for agent_name, agent_subgraph in agent_subgraphs.items():
             agent_node = create_agent_node(agent_subgraph, agent_name)
 
@@ -246,16 +266,17 @@ class GraphBuilder:
         # Set entry point
         workflow.set_entry_point("orchestrator")
 
-        # ENHANCED Orchestrator routing
+        # Enhanced orchestrator routing (unchanged - still based on task status)
         def orchestrator_router(state: GroupChatState):
-            """ENHANCED route from orchestrator based on TaskInfo status."""
+            """Route from orchestrator based on TaskInfo status (unchanged logic)."""
             active_tasks = state.get("active_tasks", {})
 
             # Get comprehensive task status
             completion_summary = get_task_completion_summary(state)
 
             logger.info(
-                "ORCHESTRATOR ROUTER - analyzing task assignment", **completion_summary
+                "ORCHESTRATOR ROUTER - analyzing task assignment with staged processing",
+                **completion_summary,
             )
 
             if not active_tasks:
@@ -296,24 +317,27 @@ class GraphBuilder:
 
         workflow.add_conditional_edges("orchestrator", orchestrator_router)
 
-        # Agent to aggregator edges
+        # Agent to aggregator edges (unchanged)
         for agent_name in agent_subgraphs.keys():
             workflow.add_edge(agent_name, "aggregator")
 
-        # COMPLETELY REDESIGNED Aggregator routing based on TaskInfo status
+        # Enhanced aggregator routing with staged message processing awareness
         def aggregator_router(state: GroupChatState):
             """
-            ENHANCED aggregator routing using TaskInfo status as authoritative source.
+            Enhanced aggregator routing with staged message processing support.
 
-            This is the critical fix - instead of relying on fragile set logic,
-            we examine TaskInfo objects directly to make routing decisions.
+            The aggregator now handles message merging, so routing logic remains
+            focused on task completion status.
             """
             # Get comprehensive completion summary
             completion_summary = get_task_completion_summary(state)
 
-            # Log detailed routing analysis
+            # Log detailed routing analysis with pending message awareness
+            pending_summary = MessageMerger.get_pending_summary(state)
             logger.info(
-                "AGGREGATOR ROUTER - comprehensive analysis", **completion_summary
+                "AGGREGATOR ROUTER - comprehensive analysis with staged processing",
+                **completion_summary,
+                **pending_summary,
             )
 
             # Early exit if no tasks
@@ -339,7 +363,7 @@ class GraphBuilder:
                 status_breakdown=status_breakdown,
             )
 
-            # Core routing logic based on completion_summary
+            # Core routing logic based on completion_summary (unchanged)
             if completion_summary["all_finished"]:
                 logger.info(
                     "AGGREGATOR ROUTER DECISION: ALL agents finished - routing to ORCHESTRATOR",
@@ -382,12 +406,14 @@ class GraphBuilder:
             "aggregator", aggregator_router, {"orchestrator": "orchestrator", END: END}
         )
 
-        logger.info("Enhanced workflow structure built successfully")
+        logger.info(
+            "Enhanced workflow structure built successfully with staged message processing"
+        )
         return workflow
 
     def get_workflow_info(self, team_config: TeamConfig) -> Dict[str, Any]:
         """
-        Get information about the workflow structure.
+        Get information about the workflow structure with staged processing details.
 
         Args:
             team_config: Team configuration
@@ -409,14 +435,22 @@ class GraphBuilder:
             "timeout_minutes": team_config.conversation_config.get(
                 "timeout_minutes", 30
             ),
-            "routing_logic": "enhanced_taskinfo_based",
-            "aggregation_mode": "batch_completion_processing",
-            "state_validation": "enabled",
+            "routing_logic": "taskinfo_based_with_staged_processing",
+            "message_processing": "staged_with_pending_queue",
+            "aggregation_mode": "batch_completion_with_message_merging",
+            "state_validation": "enabled_at_checkpoints",
+            "enhanced_features": [
+                "staged_message_processing",
+                "pending_message_queue",
+                "batch_message_merging",
+                "cursor_based_personalization",
+                "explicit_task_completion_tracking",
+            ],
         }
 
     def validate_team_config(self, team_config: TeamConfig) -> bool:
         """
-        Validate team configuration for subgraph compatibility.
+        Validate team configuration for staged message processing compatibility.
 
         Args:
             team_config: Team configuration to validate
@@ -452,7 +486,15 @@ class GraphBuilder:
                     f"Agents cannot use reserved names: {conflicts}"
                 )
 
-            logger.info("Team configuration validation passed")
+            logger.info(
+                "Team configuration validation passed for staged processing",
+                agent_count=len(team_config.agents),
+                features_validated=[
+                    "agent_name_uniqueness",
+                    "reserved_name_conflicts",
+                    "system_prompt_presence",
+                ],
+            )
             return True
 
         except Exception as e:
@@ -460,16 +502,29 @@ class GraphBuilder:
             raise
 
     def _log_graph_structure(self, graph, team_config: TeamConfig):
-        """Log the compiled graph structure for debugging."""
+        """Log the compiled graph structure with staged processing details."""
         try:
             logger.debug(
-                "Enhanced graph structure",
+                "Enhanced graph structure with staged message processing",
                 nodes=list(graph.nodes.keys()) if hasattr(graph, "nodes") else "N/A",
                 agent_count=len(team_config.agents),
                 team_name=team_config.team_name,
-                routing_enhancements="TaskInfo-based routing enabled",
-                aggregation_enhancements="Batch completion processing enabled",
-                state_validation="Enabled throughout pipeline",
+                message_processing_enhancements=[
+                    "staged_message_processing",
+                    "pending_message_queue",
+                    "batch_message_merging",
+                    "cursor_based_personalization",
+                ],
+                routing_enhancements=[
+                    "taskinfo_based_routing",
+                    "checkpoint_validation",
+                    "batch_completion_processing",
+                ],
+                state_management_enhancements=[
+                    "explicit_task_tracking",
+                    "comprehensive_state_validation",
+                    "enhanced_error_handling",
+                ],
             )
         except Exception as e:
             logger.debug("Could not log graph structure", error=str(e))
@@ -478,14 +533,14 @@ class GraphBuilder:
 # Convenience function
 def build_graph(team_config_path: Path, checkpointer: Optional[Any] = None):
     """
-    Build enhanced graph using the subgraph builder.
+    Build enhanced graph with staged message processing.
 
     Args:
         team_config_path: Path to team configuration
         checkpointer: Optional checkpointer
 
     Returns:
-        Compiled LangGraph
+        Compiled LangGraph with staged message processing
     """
     builder = GraphBuilder()
     return builder.build_graph(team_config_path, checkpointer)

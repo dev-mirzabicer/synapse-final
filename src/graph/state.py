@@ -1,4 +1,4 @@
-"""Enhanced state management for the multi-agent system with cursor-based personalization and robust task completion tracking."""
+"""Enhanced state management for the multi-agent system with staged message processing and robust task completion tracking."""
 
 import operator
 from typing import List, Dict, Set, Annotated, Optional, Any
@@ -221,6 +221,44 @@ def add_messages_without_duplicates(
     return existing + added_messages
 
 
+def merge_pending_sources(
+    existing: Dict[str, List[str]], new: Dict[str, List[str]]
+) -> Dict[str, List[str]]:
+    """
+    Merge pending sources dictionaries, tracking which agent added which messages.
+
+    Args:
+        existing: Current pending sources mapping
+        new: New pending sources to merge
+
+    Returns:
+        Merged dictionary with combined source tracking
+    """
+    if not new:
+        return existing
+
+    merged = existing.copy()
+
+    for agent_name, message_ids in new.items():
+        if agent_name in merged:
+            # Combine message IDs, avoiding duplicates
+            existing_ids = set(merged[agent_name])
+            new_ids = [msg_id for msg_id in message_ids if msg_id not in existing_ids]
+            merged[agent_name] = merged[agent_name] + new_ids
+
+            if new_ids:
+                logger.debug(
+                    f"Merged pending sources for {agent_name}: added {len(new_ids)} new message IDs"
+                )
+        else:
+            merged[agent_name] = message_ids.copy()
+            logger.debug(
+                f"Added new pending sources for {agent_name}: {len(message_ids)} message IDs"
+            )
+
+    return merged
+
+
 def merge_active_tasks(
     existing: Dict[str, TaskInfo], new: Dict[str, TaskInfo]
 ) -> Dict[str, TaskInfo]:
@@ -306,11 +344,114 @@ def unique(a: str, b: str) -> str:
     raise ValueError(f"Values are not unique: {a} != {b}")
 
 
+class MessageMerger:
+    """Utility class for managing staged message processing and merging."""
+
+    @staticmethod
+    def merge_pending_messages(state) -> Dict[str, Any]:
+        """
+        Atomically merge pending messages into main history.
+
+        Args:
+            state: Current global state
+
+        Returns:
+            Updates dictionary to apply to state
+        """
+        pending = state.get("pending_messages", [])
+
+        if not pending:
+            logger.debug("No pending messages to merge")
+            return {}
+
+        pending_sources = state.get("pending_sources", {})
+
+        logger.info(
+            "Merging pending messages to main history",
+            pending_count=len(pending),
+            current_main_count=len(state.get("messages", [])),
+            sources=list(pending_sources.keys()),
+        )
+
+        # Log detailed source breakdown for debugging
+        for agent_name, message_ids in pending_sources.items():
+            logger.debug(
+                f"Merging {len(message_ids)} messages from {agent_name}",
+                message_ids=[msg_id[:8] for msg_id in message_ids],
+            )
+
+        # Return updates to clear pending and move to main
+        return {
+            "messages": pending,  # Will be merged by add_messages_without_duplicates
+            "pending_messages": [],  # Clear pending queue
+            "pending_sources": {},  # Clear source tracking
+        }
+
+    @staticmethod
+    def should_merge_pending(state, context: str) -> bool:
+        """
+        Determine if pending messages should be merged at this point.
+
+        Args:
+            state: Current global state
+            context: Execution context for merge decision
+
+        Returns:
+            True if pending messages should be merged
+        """
+        merge_contexts = [
+            "before_aggregation",
+            "after_agent_completion",
+            "before_orchestrator_routing",
+        ]
+
+        has_pending = len(state.get("pending_messages", [])) > 0
+        is_merge_context = context in merge_contexts
+
+        if has_pending and is_merge_context:
+            logger.debug(
+                f"Should merge pending messages at context: {context}",
+                pending_count=len(state.get("pending_messages", [])),
+            )
+            return True
+
+        return False
+
+    @staticmethod
+    def get_pending_summary(state) -> Dict[str, Any]:
+        """
+        Get summary of pending messages for debugging.
+
+        Args:
+            state: Current global state
+
+        Returns:
+            Summary dictionary with pending message statistics
+        """
+        pending = state.get("pending_messages", [])
+        sources = state.get("pending_sources", {})
+
+        return {
+            "pending_count": len(pending),
+            "pending_sources": list(sources.keys()),
+            "messages_by_source": {
+                agent: len(msg_ids) for agent, msg_ids in sources.items()
+            },
+            "pending_message_types": [type(msg).__name__ for msg in pending],
+        }
+
+
 class GroupChatState(TypedDict):
-    """Enhanced state for the group chat application with agent-specific states."""
+    """Enhanced state for the group chat application with staged message processing."""
 
     messages: Annotated[List[SynapseMessage], add_messages_without_duplicates]
     """Complete global conversation history using SynapseMessages with deduplication."""
+
+    pending_messages: Annotated[List[SynapseMessage], add_messages_without_duplicates]
+    """Staging area for new messages before they're merged into main history."""
+
+    pending_sources: Annotated[Dict[str, List[str]], merge_pending_sources]
+    """Track which agent added which pending messages (for debugging and control)."""
 
     agent_states: Annotated[Dict[str, AgentInternalState], merge_agent_states]
     """Internal states for each agent (including orchestrator) with personalized histories."""
@@ -435,7 +576,7 @@ def create_initial_state(
     user_message: str, agent_names: List[str], conversation_id: str
 ) -> GroupChatState:
     """
-    Create initial state for a new conversation.
+    Create initial state for a new conversation with staged message processing.
 
     Args:
         user_message: Initial user message
@@ -443,7 +584,7 @@ def create_initial_state(
         conversation_id: Unique conversation identifier
 
     Returns:
-        Initial GroupChatState
+        Initial GroupChatState with staged processing support
     """
     from .messages import SynapseHumanMessage
 
@@ -451,6 +592,8 @@ def create_initial_state(
 
     initial_state: GroupChatState = {
         "messages": [initial_message],
+        "pending_messages": [],  # Empty staging area
+        "pending_sources": {},  # Empty source tracking
         "agent_states": initialize_agent_states(agent_names),
         "active_tasks": {},
         "completed_tasks": set(),
@@ -569,23 +712,22 @@ def validate_state_consistency(state: GroupChatState) -> bool:
         True if state is consistent, False otherwise
     """
     try:
-        # Check for message duplicates
+        # Check for message duplicates in main messages
         message_ids = [msg.message_id for msg in state["messages"]]
         if len(message_ids) != len(set(message_ids)):
             logger.error(
-                f"Duplicate messages detected in state: "
+                f"Duplicate messages detected in main history: "
                 f"{len(message_ids)} total, {len(set(message_ids))} unique"
             )
-            # Find duplicates for debugging
-            seen = set()
-            duplicates = set()
-            for msg_id in message_ids:
-                if msg_id in seen:
-                    duplicates.add(msg_id)
-                seen.add(msg_id)
+            return False
+
+        # Check for duplicates in pending messages
+        pending_ids = [msg.message_id for msg in state.get("pending_messages", [])]
+        if len(pending_ids) != len(set(pending_ids)):
             logger.error(
-                f"Duplicate message IDs: {list(duplicates)[:5]}"
-            )  # Show first 5
+                f"Duplicate messages detected in pending queue: "
+                f"{len(pending_ids)} total, {len(set(pending_ids))} unique"
+            )
             return False
 
         # Check agent states consistency
@@ -598,20 +740,7 @@ def validate_state_consistency(state: GroupChatState) -> bool:
                 )
                 return False
 
-            # Personal history should not have duplicates
-            personal_ids = []
-            for msg in agent_state.personal_history:
-                if hasattr(msg, "id") and msg.id:
-                    personal_ids.append(msg.id)
-
-            if len(personal_ids) != len(set(personal_ids)):
-                logger.error(
-                    f"Agent {agent_name} has duplicate messages in personal history: "
-                    f"{len(personal_ids)} total, {len(set(personal_ids))} unique"
-                )
-                return False
-
-        # Check task consistency using new validation
+        # Check task consistency using enhanced validation
         task_errors = validate_task_consistency(state)
         if task_errors:
             logger.error(f"Task consistency errors: {task_errors}")
@@ -640,10 +769,15 @@ def get_state_debug_info(state: GroupChatState) -> Dict[str, Any]:
             "retry_count": task_info.retry_count,
         }
 
+    # Pending message information
+    pending_summary = MessageMerger.get_pending_summary(state)
+
     return {
         "total_messages": len(state["messages"]),
         "unique_messages": len(unique_ids),
         "duplicate_count": len(message_ids) - len(unique_ids),
+        "pending_messages_count": pending_summary["pending_count"],
+        "pending_sources": pending_summary["pending_sources"],
         "agent_cursors": {
             name: agent_state.get_state_summary()
             for name, agent_state in state["agent_states"].items()
@@ -668,6 +802,7 @@ def deduplicate_messages(state: GroupChatState) -> None:
     This is a safety function that should not be needed if the state
     reducers are working correctly, but provides a fallback.
     """
+    # Deduplicate main messages
     seen_ids = set()
     unique_messages = []
     removed_count = 0
@@ -679,13 +814,35 @@ def deduplicate_messages(state: GroupChatState) -> None:
         else:
             removed_count += 1
             logger.warning(
-                f"Removing duplicate message: {type(msg).__name__} "
+                f"Removing duplicate message from main history: {type(msg).__name__} "
                 f"id={msg.message_id[:8]}... content={getattr(msg, 'content', 'N/A')[:50]}..."
             )
 
     if removed_count > 0:
-        logger.warning(f"Removed {removed_count} duplicate messages from state")
+        logger.warning(f"Removed {removed_count} duplicate messages from main history")
         state["messages"] = unique_messages
+
+    # Deduplicate pending messages
+    seen_pending_ids = set()
+    unique_pending = []
+    removed_pending_count = 0
+
+    for msg in state.get("pending_messages", []):
+        if msg.message_id not in seen_pending_ids:
+            seen_pending_ids.add(msg.message_id)
+            unique_pending.append(msg)
+        else:
+            removed_pending_count += 1
+            logger.warning(
+                f"Removing duplicate message from pending queue: {type(msg).__name__} "
+                f"id={msg.message_id[:8]}... content={getattr(msg, 'content', 'N/A')[:50]}..."
+            )
+
+    if removed_pending_count > 0:
+        logger.warning(
+            f"Removed {removed_pending_count} duplicate messages from pending queue"
+        )
+        state["pending_messages"] = unique_pending
 
 
 def get_task_completion_summary(state: GroupChatState) -> Dict[str, Any]:

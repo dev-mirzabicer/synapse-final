@@ -1,4 +1,4 @@
-"""Enhanced LangGraph nodes with subgraph-based orchestrator and robust batch aggregation."""
+"""Enhanced LangGraph nodes with staged message processing and robust batch aggregation."""
 
 from typing import Callable, Dict, Any
 from datetime import datetime
@@ -15,6 +15,7 @@ from .state import (
     get_state_debug_info,
     get_task_completion_summary,
     apply_state_validation,
+    MessageMerger,
 )
 from .personalizer import personalizer
 from .messages import (
@@ -31,7 +32,7 @@ logger = get_logger(__name__)
 
 class OrchestratorSubgraph:
     """
-    Orchestrator subgraph with cursor-based personalization but different completion logic.
+    Orchestrator subgraph with cursor-based personalization and staged message processing.
     """
 
     def __init__(self, orchestrator_runnable):
@@ -111,13 +112,13 @@ class OrchestratorSubgraph:
             raise AgentError("orchestrator", f"Orchestrator invocation failed: {e}", e)
 
     def _process_response(self, state: GroupChatState) -> Dict[str, Any]:
-        """Process orchestrator response and extract task assignments."""
+        """Process orchestrator response with staged message processing."""
         agent_state = get_agent_state(state, "orchestrator")
 
         try:
             if not agent_state.temp_new_history:
                 self.logger.error("No orchestrator response to process")
-                return {"messages": []}
+                return {"pending_messages": []}
 
             orchestrator_message = agent_state.temp_new_history[0]
             orchestrator_message.name = "orchestrator"
@@ -180,9 +181,12 @@ class OrchestratorSubgraph:
             # Clean up temp state
             personalizer.reset_agent_temp_state(state, "orchestrator")
 
-            # Build update dict - only include what's changing
+            # Build update dict using staged message processing
             updates = {
-                "messages": messages_to_add,
+                "pending_messages": messages_to_add,
+                "pending_sources": {
+                    "orchestrator": [msg.message_id for msg in messages_to_add]
+                },
                 "round_number": state.get("round_number", 0) + 1,
             }
 
@@ -197,11 +201,10 @@ class OrchestratorSubgraph:
                 updates["completed_tasks"] = set()
                 updates["failed_tasks"] = set()
 
-            logger.info(
-                "Orchestrator response processed",
-                messages_count=len(messages_to_add),
-                active_tasks_count=len(active_tasks),
-                round_number=updates["round_number"],
+            self.logger.info(
+                "Orchestrator response processed with staged messaging",
+                pending_messages_count=len(messages_to_add),
+                new_tasks_count=len(active_tasks),
             )
 
             return updates
@@ -211,19 +214,20 @@ class OrchestratorSubgraph:
             # Clean up temp state even on error
             personalizer.reset_agent_temp_state(state, "orchestrator")
 
-            # Create error message
+            # Create error message for pending queue
             error_msg = OrchestratorMessage(
                 content=f"I encountered an error: {str(e)}."
             )
             return {
-                "messages": [error_msg],
+                "pending_messages": [error_msg],
+                "pending_sources": {"orchestrator": [error_msg.message_id]},
                 "error_count": state.get("error_count", 0) + 1,
             }
 
 
 def create_orchestrator_node(orchestrator_runnable) -> Callable:
     """
-    Create orchestrator node using subgraph pattern.
+    Create orchestrator node using subgraph pattern with staged message processing.
 
     Args:
         orchestrator_runnable: The orchestrator's LangChain runnable
@@ -235,28 +239,29 @@ def create_orchestrator_node(orchestrator_runnable) -> Callable:
     orchestrator_subgraph = orchestrator_subgraph_builder.create_subgraph()
 
     def orchestrator_node(state: GroupChatState) -> Dict[str, Any]:
-        """Orchestrator node that uses subgraph."""
+        """Orchestrator node that uses subgraph with staged message processing."""
         try:
             # Log state before invocation
             logger.debug("Orchestrator node input state", **get_state_debug_info(state))
 
+            # Execute subgraph - this now returns pending messages
             result = orchestrator_subgraph.invoke(state)
 
             # Log what we're returning
-            if "messages" in result:
-                logger.debug(
-                    f"Orchestrator returning {len(result['messages'])} new messages"
-                )
+            pending_count = len(result.get("pending_messages", []))
+            if pending_count > 0:
+                logger.debug(f"Orchestrator returning {pending_count} pending messages")
 
             return result
         except Exception as e:
             logger.error("Orchestrator subgraph failed", error=str(e))
-            # Return error state
+            # Return error state with staged processing
             error_msg = OrchestratorMessage(
                 content=f"Orchestrator encountered an error: {str(e)}"
             )
             return {
-                "messages": [error_msg],
+                "pending_messages": [error_msg],
+                "pending_sources": {"orchestrator": [error_msg.message_id]},
                 "error_count": state.get("error_count", 0) + 1,
             }
 
@@ -265,7 +270,7 @@ def create_orchestrator_node(orchestrator_runnable) -> Callable:
 
 def create_agent_node(agent_subgraph: StateGraph, agent_name: str) -> Callable:
     """
-    Create an agent node using the agent subgraph.
+    Create an agent node using the agent subgraph with staged message processing.
 
     Args:
         agent_subgraph: Compiled agent subgraph
@@ -276,7 +281,7 @@ def create_agent_node(agent_subgraph: StateGraph, agent_name: str) -> Callable:
     """
 
     def agent_node(state: GroupChatState) -> Dict[str, Any]:
-        """Agent node that uses subgraph."""
+        """Agent node that uses subgraph with staged message processing."""
         agent_logger = get_logger("agent_node").bind(agent_name=agent_name)
         agent_logger.info("Starting agent execution")
 
@@ -297,14 +302,13 @@ def create_agent_node(agent_subgraph: StateGraph, agent_name: str) -> Callable:
             # Log state before invocation
             agent_logger.debug("Agent node input state", **get_state_debug_info(state))
 
-            # Execute agent subgraph
+            # Execute agent subgraph - this now returns pending messages
             result = agent_subgraph.invoke(state)
 
             # Log what we're returning
-            if "messages" in result:
-                agent_logger.debug(
-                    f"Agent returning {len(result['messages'])} new messages"
-                )
+            pending_count = len(result.get("pending_messages", []))
+            if pending_count > 0:
+                agent_logger.debug(f"Agent returning {pending_count} pending messages")
 
             agent_logger.info("Agent subgraph completed successfully")
             return result
@@ -316,7 +320,7 @@ def create_agent_node(agent_subgraph: StateGraph, agent_name: str) -> Callable:
             if task_info:
                 task_info.mark_failed(str(e))
 
-            # Create error message
+            # Create error message for staged processing
             from .messages import AgentMessage
 
             error_message = AgentMessage(
@@ -326,7 +330,8 @@ def create_agent_node(agent_subgraph: StateGraph, agent_name: str) -> Callable:
             )
 
             return {
-                "messages": [error_message],
+                "pending_messages": [error_message],
+                "pending_sources": {agent_name: [error_message.message_id]},
                 "failed_tasks": {agent_name},
                 "active_tasks": {agent_name: task_info} if task_info else {},
                 "error_count": state.get("error_count", 0) + 1,
@@ -337,35 +342,49 @@ def create_agent_node(agent_subgraph: StateGraph, agent_name: str) -> Callable:
 
 def aggregator_node(state: GroupChatState) -> Dict[str, Any]:
     """
-    COMPLETELY REDESIGNED aggregator node that handles ALL agent completions in batch.
+    Enhanced aggregator node with staged message processing and batch completion handling.
 
-    This is the core fix for the concurrent execution issue. Instead of relying on
-    message analysis, it examines TaskInfo status directly and processes ALL
-    completions in a single call.
+    This aggregator:
+    1. First merges any pending messages from completed agents
+    2. Then processes task completion status updates
+    3. Maintains state consistency throughout
     """
-    logger.info("Starting ENHANCED aggregator with batch completion processing")
+    logger.info("Starting aggregator with staged message processing")
 
-    # Get current task completion status
+    # Phase 1: Merge pending messages if any exist
+    updates = {}
+
+    if MessageMerger.should_merge_pending(state, "before_aggregation"):
+        pending_summary = MessageMerger.get_pending_summary(state)
+        logger.info("Merging pending messages in aggregator", **pending_summary)
+
+        merge_updates = MessageMerger.merge_pending_messages(state)
+        updates.update(merge_updates)
+
+        logger.info(
+            "Successfully merged pending messages",
+            merged_count=len(state.get("pending_messages", [])),
+        )
+
+    # Phase 2: Process task completions (existing enhanced logic)
     completion_summary = get_task_completion_summary(state)
-
-    # Log comprehensive status before processing
-    logger.info("Enhanced aggregator - BEFORE processing", **completion_summary)
+    logger.info("Aggregator - analyzing task completion status", **completion_summary)
 
     # Early exit if no tasks
     if not completion_summary["has_tasks"]:
-        logger.warning("No active tasks to aggregate")
-        return {}
+        logger.warning("No active tasks to process in aggregator")
+        return updates
 
     active_tasks = state.get("active_tasks", {})
 
-    # CRITICAL: Process ALL task statuses in batch, not just last message
+    # CRITICAL: Process ALL task statuses in batch
     completed_agents = []
     failed_agents = []
     in_progress_agents = []
     pending_agents = []
 
     # Log detailed task analysis
-    logger.info("BATCH ANALYSIS - examining all task statuses:")
+    logger.info("Batch analysis - examining all task statuses:")
     for agent_name, task_info in active_tasks.items():
         status_summary = task_info.get_status_summary()
         logger.info(f"  {agent_name}: {status_summary}")
@@ -379,11 +398,11 @@ def aggregator_node(state: GroupChatState) -> Dict[str, Any]:
         else:  # pending
             pending_agents.append(agent_name)
 
-    # Update completion tracking sets for compatibility with existing router
+    # Update completion tracking sets
     completed_tasks = set(completed_agents)
     failed_tasks = set(failed_agents)
 
-    # Reset agent states for completed agents (important for next round)
+    # Reset agent states for completed agents
     for agent_name in completed_agents:
         agent_state = get_agent_state(state, agent_name)
         agent_state.reset_turn_state()
@@ -391,7 +410,7 @@ def aggregator_node(state: GroupChatState) -> Dict[str, Any]:
 
     # Log comprehensive aggregation results
     logger.info(
-        "ENHANCED aggregator - BATCH processing results",
+        "Aggregator - batch processing results",
         total_tasks=len(active_tasks),
         completed_agents=completed_agents,
         completed_count=len(completed_agents),
@@ -402,15 +421,9 @@ def aggregator_node(state: GroupChatState) -> Dict[str, Any]:
         pending_agents=pending_agents,
         pending_count=len(pending_agents),
         all_finished=len(completed_agents) + len(failed_agents) == len(active_tasks),
-        ready_for_orchestrator=len(completed_agents) + len(failed_agents)
-        == len(active_tasks)
-        and len(active_tasks) > 0,
     )
 
-    # Build updates - only return what's changing
-    updates = {}
-
-    # Update completed/failed task sets if they've changed
+    # Build task completion updates
     current_completed = state.get("completed_tasks", set())
     current_failed = state.get("failed_tasks", set())
 
@@ -428,24 +441,25 @@ def aggregator_node(state: GroupChatState) -> Dict[str, Any]:
     if active_tasks:
         updates["active_tasks"] = active_tasks
 
-    # Validate state consistency
+    # Validate state consistency for the updates
     if updates:
         # Create a mock updated state for validation
         test_state = state.copy()
         test_state.update(updates)
         validation_passed = apply_state_validation(
-            test_state, "after enhanced aggregator"
+            test_state, "after aggregator processing"
         )
 
         if not validation_passed:
-            logger.error("Enhanced aggregator produced invalid state updates!")
+            logger.error("Aggregator produced invalid state updates!")
         else:
-            logger.debug("Enhanced aggregator state updates validated successfully")
+            logger.debug("Aggregator state updates validated successfully")
 
     logger.info(
-        "Enhanced aggregator completed - returning updates",
+        "Aggregator completed with staged message processing",
         update_keys=list(updates.keys()),
         updates_summary={
+            "pending_messages_merged": "pending_messages" in updates,
             "completed_tasks": list(updates.get("completed_tasks", [])),
             "failed_tasks": list(updates.get("failed_tasks", [])),
             "active_tasks_count": len(updates.get("active_tasks", {})),
@@ -457,7 +471,7 @@ def aggregator_node(state: GroupChatState) -> Dict[str, Any]:
 
 class AgentSubgraph:
     """
-    Creates and manages an agent subgraph with cursor-based personalization and enhanced completion tracking.
+    Creates and manages an agent subgraph with staged message processing and enhanced completion tracking.
     """
 
     def __init__(self, agent_config: AgentConfig, team_config: TeamConfig, react_agent):
@@ -470,7 +484,7 @@ class AgentSubgraph:
 
     def create_subgraph(self) -> StateGraph:
         """
-        Create the agent subgraph with proper flow control.
+        Create the agent subgraph with proper flow control and staged message processing.
 
         Returns:
             Compiled StateGraph for this agent
@@ -706,21 +720,21 @@ class AgentSubgraph:
 
     def _extract_new_messages(self, state: GroupChatState) -> Dict[str, Any]:
         """
-        ENHANCED: Extract and convert new messages for global history, EXPLICITLY mark task completion.
+        Enhanced message extraction with staged processing and explicit task completion marking.
 
-        This is the CRITICAL fix - we explicitly mark the TaskInfo as completed here.
+        This is the CRITICAL fix - we explicitly mark the TaskInfo as completed and use staged processing.
         """
         agent_state = get_agent_state(state, self.agent_name)
 
         try:
             if not agent_state.has_temp_history():
                 self.logger.warning("No temp history to extract from")
-                return {"messages": []}
+                return {"pending_messages": []}
 
             # Calculate original length before invocation
             original_length = len(agent_state.personal_history)
 
-            # Convert to SynapseMessages for global history
+            # Convert to SynapseMessages for staged processing
             new_synapse_messages = from_langchain_messages(
                 agent_state.temp_new_history,  # Full history for context
                 self.agent_name,
@@ -760,29 +774,27 @@ class AgentSubgraph:
             agent_state.continuation_attempts = 0  # Reset for next time
 
             self.logger.info(
-                "Successfully extracted new messages and COMPLETED task",
+                "Successfully extracted messages with staged processing",
                 agent=self.agent_name,
-                new_messages_count=len(new_synapse_messages),
+                pending_messages_count=len(new_synapse_messages),
                 task_explicitly_marked_completed=self.agent_name in task_updates,
             )
 
             # Log message types for debugging
             message_types = [type(msg).__name__ for msg in new_synapse_messages]
             self.logger.debug(
-                "New message types", agent=self.agent_name, types=message_types
+                "Pending message types", agent=self.agent_name, types=message_types
             )
 
-            # Build result with explicit task completion
-            result = {"messages": new_synapse_messages}
+            # Build result with staged message processing
+            result = {
+                "pending_messages": new_synapse_messages,
+                "pending_sources": {
+                    self.agent_name: [msg.message_id for msg in new_synapse_messages]
+                },
+            }
             if task_updates:
                 result["active_tasks"] = task_updates
-
-            self.logger.info(
-                "Returning extracted messages and task updates",
-                agent=self.agent_name,
-                messages_count=len(new_synapse_messages),
-                active_tasks_count=len(task_updates),
-            )
 
             return result
 
@@ -791,7 +803,7 @@ class AgentSubgraph:
                 "Failed to extract new messages", agent=self.agent_name, error=str(e)
             )
 
-            # ENHANCED ERROR HANDLING: Mark task as failed
+            # ENHANCED ERROR HANDLING: Mark task as failed with staged processing
             active_tasks = state.get("active_tasks", {})
             task_updates = {}
             failed_tasks = set()
@@ -816,8 +828,12 @@ class AgentSubgraph:
             agent_state.turn_finished = True
             agent_state.continuation_attempts = 0
 
-            # Return error state with task marked as failed
-            result = {"messages": [], "error_count": state.get("error_count", 0) + 1}
+            # Return error state with staged processing
+            result = {
+                "pending_messages": [],
+                "pending_sources": {},
+                "error_count": state.get("error_count", 0) + 1,
+            }
             if task_updates:
                 result["active_tasks"] = task_updates
             if failed_tasks:
@@ -864,7 +880,7 @@ def create_agent_subgraph(
     agent_config: AgentConfig, team_config: TeamConfig, react_agent
 ) -> StateGraph:
     """
-    Create an agent subgraph.
+    Create an agent subgraph with staged message processing.
 
     Args:
         agent_config: Configuration for the agent
