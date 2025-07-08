@@ -189,20 +189,27 @@ def add_messages_without_duplicates(
     """
     Add only truly new messages, preventing duplicates.
 
-    This custom reducer ensures messages are never duplicated in the global state.
-    It uses message_id for deduplication, which is guaranteed to be unique.
+    This custom reducer is enhanced to handle LangGraph's implicit state pass-through
+    by checking for object identity (`new is existing`), which avoids reprocessing
+    and warning logs when the message list hasn't actually been updated.
     """
+    # Handle special "clear" command for pending messages
     if new == "clear":
-        logger.debug("Clearing pending messages")
+        logger.debug("Clearing message list")
         return []
 
+    # No new messages to add
     if not new:
+        return existing
+
+    # CRITICAL FIX: If 'new' is the same object as 'existing', it means a node
+    # returned an update for a different state key, and LangGraph implicitly
+    # passed the 'messages' key along. We can safely and efficiently skip.
+    if new is existing:
         return existing
 
     # Create a set of existing message IDs for O(1) lookup
     existing_ids = {msg.message_id for msg in existing}
-
-    # Track order of addition for debugging
     added_messages = []
 
     # Only add messages that aren't already in the list
@@ -210,16 +217,18 @@ def add_messages_without_duplicates(
         if msg.message_id not in existing_ids:
             added_messages.append(msg)
             existing_ids.add(msg.message_id)  # Update the set for subsequent checks
-        else:
-            logger.warning(
-                f"Prevented duplicate message: {type(msg).__name__} "
-                f"with id {msg.message_id[:8]}... content: {getattr(msg, 'content', 'N/A')[:50]}..."
-            )
+        # The warning for duplicates is no longer needed as the `is` check handles the noisy cases.
+        # A warning can still be useful for genuine, unexpected duplicate IDs, but for now,
+        # let's remove it to clean up the logs as requested.
+        # else:
+        #     logger.warning(
+        #         f"Duplicate message ID detected and ignored: {msg.message_id[:8]}"
+        #     )
 
     if added_messages:
         logger.debug(
-            f"Adding {len(added_messages)} new messages to state. "
-            f"Total will be: {len(existing) + len(added_messages)}"
+            f"Reducer: Adding {len(added_messages)} new messages to a list of {len(existing)}. "
+            f"New total: {len(existing) + len(added_messages)}"
         )
 
     return existing + added_messages
