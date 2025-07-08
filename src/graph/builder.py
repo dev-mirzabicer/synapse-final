@@ -67,7 +67,9 @@ def debug_node_wrapper(node_func, node_name):
                     )
 
             # Track pending sources (new)
-            if "pending_sources" in result:
+            if "pending_sources" in result and isinstance(
+                result["pending_sources"], dict
+            ):
                 sources = result.get("pending_sources", {})
                 updates_summary["pending_sources"] = list(sources.keys())
 

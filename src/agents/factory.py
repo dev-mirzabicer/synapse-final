@@ -112,7 +112,7 @@ class AgentFactory:
                 tools=tools,
                 prompt=prompt,
                 checkpointer=None,  # Will be set at graph level
-                debug=settings.log_level == "DEBUG",
+                # debug=settings.log_level == "DEBUG",
             )
 
             logger.info("Successfully created ReAct agent")

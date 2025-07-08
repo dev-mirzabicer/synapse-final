@@ -192,6 +192,10 @@ def add_messages_without_duplicates(
     This custom reducer ensures messages are never duplicated in the global state.
     It uses message_id for deduplication, which is guaranteed to be unique.
     """
+    if new == "clear":
+        logger.debug("Clearing pending messages")
+        return []
+
     if not new:
         return existing
 
@@ -234,6 +238,10 @@ def merge_pending_sources(
     Returns:
         Merged dictionary with combined source tracking
     """
+    if new == "clear":
+        logger.debug("Clearing pending sources")
+        return {}
+
     if not new:
         return existing
 
@@ -360,11 +368,14 @@ class MessageMerger:
         """
         pending = state.get("pending_messages", [])
 
-        if not pending:
+        if not pending or isinstance(pending, str):
             logger.debug("No pending messages to merge")
             return {}
 
         pending_sources = state.get("pending_sources", {})
+
+        if isinstance(pending_sources, str):
+            pending_sources = {}
 
         logger.info(
             "Merging pending messages to main history",
@@ -383,8 +394,8 @@ class MessageMerger:
         # Return updates to clear pending and move to main
         return {
             "messages": pending,  # Will be merged by add_messages_without_duplicates
-            "pending_messages": [],  # Clear pending queue
-            "pending_sources": {},  # Clear source tracking
+            "pending_messages": "clear",  # Clear pending queue
+            "pending_sources": "clear",  # Clear source tracking
         }
 
     @staticmethod
@@ -430,6 +441,12 @@ class MessageMerger:
         """
         pending = state.get("pending_messages", [])
         sources = state.get("pending_sources", {})
+
+        if isinstance(pending, str):
+            pending = []
+
+        if isinstance(sources, str):
+            sources = {}
 
         return {
             "pending_count": len(pending),
