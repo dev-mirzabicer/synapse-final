@@ -892,7 +892,7 @@ def get_task_completion_summary(state: GroupChatState) -> Dict[str, Any]:
         "completed_count": len(completed_agents),
         "failed_count": len(failed_agents),
         "in_progress_count": len(in_progress_agents),
-        "pending_count": len(pending_agents),
+        "comp_pending_count": len(pending_agents),
         "finished_count": finished_count,
         "completion_percentage": (finished_count / total_count * 100)
         if total_count > 0

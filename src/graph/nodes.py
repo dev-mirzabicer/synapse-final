@@ -22,6 +22,7 @@ from .messages import (
     from_langchain_messages,
     OrchestratorMessage,
     SynapseToolMessage,
+    SynapseSystemMessage,
     has_finish_turn_marker,
 )
 from src.core.logging import get_logger
@@ -32,7 +33,12 @@ logger = get_logger(__name__)
 
 class OrchestratorSubgraph:
     """
-    Orchestrator subgraph with cursor-based personalization and staged message processing.
+    Orchestrator subgraph with direct global state updates and explicit task assignment.
+
+    Key architectural changes:
+    - Orchestrator messages go directly to global state (no pending queue)
+    - Task assignments create explicit SynapseSystemMessage instances
+    - Tool messages are properly scoped to orchestrator
     """
 
     def __init__(self, orchestrator_runnable):
@@ -112,13 +118,21 @@ class OrchestratorSubgraph:
             raise AgentError("orchestrator", f"Orchestrator invocation failed: {e}", e)
 
     def _process_response(self, state: GroupChatState) -> Dict[str, Any]:
-        """Process orchestrator response with staged message processing."""
+        """
+        Process orchestrator response with direct global state updates.
+
+        This is the key architectural fix:
+        - Orchestrator messages go directly to global state
+        - Task assignments create explicit system messages
+        - No pending message queue for orchestrator
+        """
         agent_state = get_agent_state(state, "orchestrator")
 
         try:
             if not agent_state.temp_new_history:
                 self.logger.error("No orchestrator response to process")
-                return {"pending_messages": []}
+                # Return empty update - no messages to add
+                return {"round_number": state.get("round_number", 0) + 1}
 
             orchestrator_message = agent_state.temp_new_history[0]
             orchestrator_message.name = "orchestrator"
@@ -128,27 +142,37 @@ class OrchestratorSubgraph:
                     "Orchestrator returned multiple messages, only processing the first"
                 )
 
-            # Process tool calls for task assignments
+            # Initialize collections for direct global state updates
+            global_messages_to_add = []
             active_tasks = {}
-            messages_to_add = []
 
-            # Add the orchestrator message as OrchestratorMessage
+            # Create the orchestrator message for global state
             synapse_orchestrator_msg = OrchestratorMessage(
                 content=orchestrator_message.content,
                 tool_calls=getattr(orchestrator_message, "tool_calls", []),
             )
-            messages_to_add.append(synapse_orchestrator_msg)
+            global_messages_to_add.append(synapse_orchestrator_msg)
 
-            # Process tool calls
-            if (
-                hasattr(orchestrator_message, "tool_calls")
-                and orchestrator_message.tool_calls
-            ):
-                for tool_call in orchestrator_message.tool_calls:
+            self.logger.info(
+                "Processing orchestrator response with direct global state updates",
+                has_tool_calls=bool(getattr(orchestrator_message, "tool_calls", [])),
+                message_content_preview=orchestrator_message.content[:100],
+            )
+
+            # Process tool calls and create task assignments
+            tool_calls = getattr(orchestrator_message, "tool_calls", [])
+            if tool_calls:
+                for tool_call in tool_calls:
                     if tool_call["name"] == "assign_tasks":
                         tasks = tool_call["args"].get("tasks", {})
 
-                        # Create TaskInfo objects
+                        self.logger.info(
+                            "Processing task assignments",
+                            task_count=len(tasks),
+                            assigned_agents=list(tasks.keys()),
+                        )
+
+                        # Create TaskInfo objects and prepare agent states
                         for agent_name, task_desc in tasks.items():
                             active_tasks[agent_name] = TaskInfo(
                                 agent_name=agent_name,
@@ -157,40 +181,51 @@ class OrchestratorSubgraph:
                                 status="pending",
                             )
 
-                            # Get agent state and prepare for new task
+                            # Prepare agent state for new task
                             task_agent_state = get_agent_state(state, agent_name)
                             task_agent_state.current_task = active_tasks[agent_name]
-                            # Agent is ready to start a new task (not currently working)
-                            task_agent_state.turn_finished = True
+                            task_agent_state.turn_finished = True  # Ready for new task
                             task_agent_state.continuation_attempts = 0
                             task_agent_state.temp_new_history = None
 
-                        self.logger.info(
-                            "Tasks assigned by orchestrator", tasks=list(tasks.keys())
-                        )
+                            # Create explicit task assignment system message
+                            task_assignment_msg = SynapseSystemMessage(
+                                content=f"[TASK ASSIGNMENT] You have been assigned: {task_desc}",
+                                target_agent=agent_name,
+                            )
+                            global_messages_to_add.append(task_assignment_msg)
 
-                        # Create tool message
-                        tool_message = SynapseToolMessage(
+                            self.logger.debug(
+                                "Created task assignment",
+                                agent=agent_name,
+                                task_preview=task_desc[:50],
+                            )
+
+                        # Create private tool message for orchestrator (not visible to agents)
+                        orchestrator_tool_message = SynapseToolMessage(
                             content=f"Tasks assigned: {', '.join(tasks.keys())}",
                             tool_call_id=tool_call["id"],
                             caller_agent="orchestrator",
                             tool_name="assign_tasks",
                         )
-                        messages_to_add.append(tool_message)
+                        global_messages_to_add.append(orchestrator_tool_message)
+
+                        self.logger.info(
+                            "Task assignments processed",
+                            assigned_agents=list(tasks.keys()),
+                            global_messages_count=len(global_messages_to_add),
+                        )
 
             # Clean up temp state
             personalizer.reset_agent_temp_state(state, "orchestrator")
 
-            # Build update dict using staged message processing
+            # Build direct global state updates (no pending messages)
             updates = {
-                "pending_messages": messages_to_add,
-                "pending_sources": {
-                    "orchestrator": [msg.message_id for msg in messages_to_add]
-                },
+                "messages": global_messages_to_add,  # Direct to global state
                 "round_number": state.get("round_number", 0) + 1,
             }
 
-            # Only update active_tasks if there are new ones
+            # Add active tasks if any were assigned
             if active_tasks:
                 # Merge with existing active tasks
                 current_active = state.get("active_tasks", {}).copy()
@@ -202,9 +237,10 @@ class OrchestratorSubgraph:
                 updates["failed_tasks"] = set()
 
             self.logger.info(
-                "Orchestrator response processed with staged messaging",
-                pending_messages_count=len(messages_to_add),
+                "Orchestrator response processed with direct global state updates",
+                global_messages_count=len(global_messages_to_add),
                 new_tasks_count=len(active_tasks),
+                update_keys=list(updates.keys()),
             )
 
             return updates
@@ -214,20 +250,20 @@ class OrchestratorSubgraph:
             # Clean up temp state even on error
             personalizer.reset_agent_temp_state(state, "orchestrator")
 
-            # Create error message for pending queue
+            # Create error message for direct global state
             error_msg = OrchestratorMessage(
                 content=f"I encountered an error: {str(e)}."
             )
             return {
-                "pending_messages": [error_msg],
-                "pending_sources": {"orchestrator": [error_msg.message_id]},
+                "messages": [error_msg],  # Direct to global state
                 "error_count": state.get("error_count", 0) + 1,
+                "round_number": state.get("round_number", 0) + 1,
             }
 
 
 def create_orchestrator_node(orchestrator_runnable) -> Callable:
     """
-    Create orchestrator node using subgraph pattern with staged message processing.
+    Create orchestrator node using subgraph pattern with direct global state updates.
 
     Args:
         orchestrator_runnable: The orchestrator's LangChain runnable
@@ -239,30 +275,32 @@ def create_orchestrator_node(orchestrator_runnable) -> Callable:
     orchestrator_subgraph = orchestrator_subgraph_builder.create_subgraph()
 
     def orchestrator_node(state: GroupChatState) -> Dict[str, Any]:
-        """Orchestrator node that uses subgraph with staged message processing."""
+        """Orchestrator node that uses subgraph with direct global state updates."""
         try:
             # Log state before invocation
             logger.debug("Orchestrator node input state", **get_state_debug_info(state))
 
-            # Execute subgraph - this now returns pending messages
+            # Execute subgraph - now returns direct global state updates
             result = orchestrator_subgraph.invoke(state)
 
             # Log what we're returning
-            pending_count = len(result.get("pending_messages", []))
-            if pending_count > 0:
-                logger.debug(f"Orchestrator returning {pending_count} pending messages")
+            message_count = len(result.get("messages", []))
+            if message_count > 0:
+                logger.debug(
+                    f"Orchestrator returning {message_count} messages for direct global state update"
+                )
 
             return result
         except Exception as e:
             logger.error("Orchestrator subgraph failed", error=str(e))
-            # Return error state with staged processing
+            # Return error state with direct global updates
             error_msg = OrchestratorMessage(
                 content=f"Orchestrator encountered an error: {str(e)}"
             )
             return {
-                "pending_messages": [error_msg],
-                "pending_sources": {"orchestrator": [error_msg.message_id]},
+                "messages": [error_msg],  # Direct to global state
                 "error_count": state.get("error_count", 0) + 1,
+                "round_number": state.get("round_number", 0) + 1,
             }
 
     return orchestrator_node
@@ -302,7 +340,7 @@ def create_agent_node(agent_subgraph: StateGraph, agent_name: str) -> Callable:
             # Log state before invocation
             agent_logger.debug("Agent node input state", **get_state_debug_info(state))
 
-            # Execute agent subgraph - this now returns pending messages
+            # Execute agent subgraph - this returns pending messages
             result = agent_subgraph.invoke(state)
 
             # Log what we're returning
@@ -342,42 +380,49 @@ def create_agent_node(agent_subgraph: StateGraph, agent_name: str) -> Callable:
 
 def aggregator_node(state: GroupChatState) -> Dict[str, Any]:
     """
-    Enhanced aggregator node with staged message processing and batch completion handling.
+    Enhanced aggregator node with atomic pending message merging and improved separation of concerns.
 
-    This aggregator:
-    1. First merges any pending messages from completed agents
-    2. Then processes task completion status updates
-    3. Maintains state consistency throughout
+    This aggregator now has clearer separation:
+    1. ALWAYS atomically merge pending messages (if any exist)
+    2. Process task completion status updates
+    3. Maintain state consistency throughout
+
+    The routing logic is handled separately in the aggregator router.
     """
-    logger.info("Starting aggregator with staged message processing")
+    logger.info("Starting aggregator with atomic pending message processing")
 
-    # Phase 1: Merge pending messages if any exist
+    # Phase 1: ATOMIC pending message merge (always happens if pending messages exist)
     updates = {}
 
-    if MessageMerger.should_merge_pending(state, "before_aggregation"):
+    pending_messages = state.get("pending_messages", [])
+    if pending_messages:
         pending_summary = MessageMerger.get_pending_summary(state)
-        logger.info("Merging pending messages in aggregator", **pending_summary)
+        logger.info("Atomically merging pending messages", **pending_summary)
 
+        # Atomic merge operation
         merge_updates = MessageMerger.merge_pending_messages(state)
         updates.update(merge_updates)
 
         logger.info(
-            "Successfully merged pending messages",
-            merged_count=len(state.get("pending_messages", [])),
+            "Successfully merged pending messages atomically",
+            merged_count=len(pending_messages),
+            sources_processed=list(pending_summary.get("pending_sources", [])),
         )
+    else:
+        logger.debug("No pending messages to merge")
 
-    # Phase 2: Process task completions (existing enhanced logic)
+    # Phase 2: Process task completion status (existing logic, unchanged)
     completion_summary = get_task_completion_summary(state)
     logger.info("Aggregator - analyzing task completion status", **completion_summary)
 
     # Early exit if no tasks
     if not completion_summary["has_tasks"]:
-        logger.warning("No active tasks to process in aggregator")
+        logger.info("No active tasks to process in aggregator")
         return updates
 
     active_tasks = state.get("active_tasks", {})
 
-    # CRITICAL: Process ALL task statuses in batch
+    # Process ALL task statuses in batch
     completed_agents = []
     failed_agents = []
     in_progress_agents = []
@@ -456,10 +501,11 @@ def aggregator_node(state: GroupChatState) -> Dict[str, Any]:
             logger.debug("Aggregator state updates validated successfully")
 
     logger.info(
-        "Aggregator completed with staged message processing",
+        "Aggregator completed with atomic message processing",
         update_keys=list(updates.keys()),
         updates_summary={
-            "pending_messages_merged": "pending_messages" in updates,
+            "pending_messages_merged": "messages" in updates,
+            "pending_queue_cleared": "pending_messages" in updates,
             "completed_tasks": list(updates.get("completed_tasks", [])),
             "failed_tasks": list(updates.get("failed_tasks", [])),
             "active_tasks_count": len(updates.get("active_tasks", {})),
@@ -472,6 +518,9 @@ def aggregator_node(state: GroupChatState) -> Dict[str, Any]:
 class AgentSubgraph:
     """
     Creates and manages an agent subgraph with staged message processing and enhanced completion tracking.
+
+    This class remains largely unchanged, as the agent logic is working correctly.
+    The key is that agents still return pending messages, which get processed by the aggregator.
     """
 
     def __init__(self, agent_config: AgentConfig, team_config: TeamConfig, react_agent):
@@ -517,6 +566,11 @@ class AgentSubgraph:
     def _update_personal_history(self, state: GroupChatState) -> Dict[str, Any]:
         """
         Update agent's personal history using cursor-based approach.
+
+        This should now properly include:
+        - User messages
+        - Orchestrator messages (now in global state)
+        - Task assignment system messages (target_agent specific)
 
         Args:
             state: Current global state
@@ -722,7 +776,7 @@ class AgentSubgraph:
         """
         Enhanced message extraction with staged processing and explicit task completion marking.
 
-        This is the CRITICAL fix - we explicitly mark the TaskInfo as completed and use staged processing.
+        This continues to use the pending message pattern for agents (only orchestrator uses direct updates).
         """
         agent_state = get_agent_state(state, self.agent_name)
 
